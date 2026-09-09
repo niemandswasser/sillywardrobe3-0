@@ -12,231 +12,27 @@ export const MODULE_NAME = 'inline_image_gen';
 // Limits / глобальные константы размерностей.
 export const MAX_CONTEXT_IMAGES = 3;
 export const MAX_GENERATION_REFERENCE_IMAGES = 5;
-// Lorebooks can contain a large catalog; provider limits are applied when
-// references are matched for a request.
+// Hard cap на размер коллекции additional references. В v2.0 старый лимит 8
+// был UI-ограничением; теперь «лорбук» даёт пользователю намного больше
+// записей, а на этап генерации всё равно попадает только столько, сколько
+// поддерживает активная модель (см. provider capabilities).
 export const MAX_ADDITIONAL_REFERENCES = 256;
 
-// Default instruction added to the prompt when reference images are sent.
-// The value is editable in settings and can be disabled.
+// Дефолтная «критическая» инструкция, которая дописывается в начало prompt'а
+// когда хотя бы один референс отправляется провайдеру. Раньше была
+// захардкожена в 3 местах `providers.js` (Gemini / OpenRouter / Naistera).
+// Теперь редактируется в настройках и может быть отключена целиком.
 export const DEFAULT_REF_INSTRUCTION = '[CRITICAL: The reference image(s) above show the EXACT appearance of the character(s). You MUST precisely copy their: face structure, eye color, hair color and style, skin tone, body type, clothing, and all distinctive features. Do not deviate from the reference appearances.]';
-
-const NON_SCHEMA_SETTING_KEYS = Object.freeze([
-    'additionalReferences',
-    'stylePresets',
-    'naisteraSendCharacterDescriptions',
-]);
-
-function migratedAppearanceItemId(type, bucket, key, index) {
-    const input = `${type}:${bucket}:${key}:${index}`;
-    let hash = 2166136261;
-    for (let i = 0; i < input.length; i += 1) {
-        hash ^= input.charCodeAt(i);
-        hash = Math.imul(hash, 16777619);
-    }
-    return `iig-migrated-${type}-${(hash >>> 0).toString(36)}`;
-}
-
-function migratedCharacterLibraryKey(bucket, key) {
-    const value = String(key || '').trim();
-    if (bucket === 'users' && value.startsWith('persona:')) {
-        return `avatar:${value.slice('persona:'.length)}`;
-    }
-    return value;
-}
-
-function appearanceItemSignature(item) {
-    const type = item?.type === 'image' ? 'image' : 'text';
-    return [
-        type,
-        String(item?.imagePath || '').trim(),
-        String(item?.description || '').replace(/\s+/g, ' ').trim(),
-    ].join('\n');
-}
-
-function appendUniqueAppearanceItem(items, item) {
-    const signature = appearanceItemSignature(item);
-    if (items.some((existing) => appearanceItemSignature(existing) === signature)) return;
-    items.push(item);
-}
-
-function migrateCharacterLibraryEntry(raw, bucket, key) {
-    const entry = raw && typeof raw === 'object' ? { ...raw } : {};
-    const items = Array.isArray(entry.appearanceItems) ? [...entry.appearanceItems] : [];
-
-    const descriptions = Array.isArray(entry.descriptions) ? entry.descriptions : [];
-    descriptions.forEach((description, index) => {
-        const text = String(description?.text || description?.description || '').trim();
-        if (!text) return;
-        appendUniqueAppearanceItem(items, {
-            id: String(description?.id || '').trim() || migratedAppearanceItemId('text', bucket, key, index),
-            type: 'text',
-            enabled: description?.enabled !== false,
-            imagePath: '',
-            description: text,
-        });
-    });
-
-    const references = Array.isArray(entry.references) ? entry.references : [];
-    references.forEach((reference, index) => {
-        appendUniqueAppearanceItem(items, {
-            id: String(reference?.id || '').trim() || migratedAppearanceItemId('image', bucket, key, index),
-            type: 'image',
-            enabled: reference?.enabled !== false,
-            imagePath: String(reference?.imagePath || '').trim(),
-            description: String(reference?.description || '').trim(),
-        });
-    });
-
-    entry.appearanceItems = items;
-    delete entry.descriptions;
-    delete entry.references;
-    return entry;
-}
-
-function mergeCharacterLibraryEntries(target, source) {
-    if (!target) return source;
-    const merged = { ...source, ...target };
-    merged.displayName = String(target.displayName || source.displayName || '').trim();
-    merged.primary = target.primary || source.primary;
-    merged.generations = Array.isArray(target.generations) ? [...target.generations] : [];
-    for (const generation of Array.isArray(source.generations) ? source.generations : []) {
-        if (!merged.generations.some((item) => item?.imagePath === generation?.imagePath)) {
-            merged.generations.push(generation);
-        }
-    }
-    merged.appearanceItems = Array.isArray(target.appearanceItems) ? [...target.appearanceItems] : [];
-    for (const item of Array.isArray(source.appearanceItems) ? source.appearanceItems : []) {
-        appendUniqueAppearanceItem(merged.appearanceItems, item);
-    }
-    return merged;
-}
-
-function characterReferenceSettingsNeedMigration(settings) {
-    if (settings.characterReferenceDescriptions && typeof settings.characterReferenceDescriptions === 'object') {
-        return true;
-    }
-    const library = settings.characterReferenceLibrary;
-    if (!library || typeof library !== 'object') return false;
-    for (const bucket of ['characters', 'users']) {
-        const entries = library[bucket];
-        if (!entries || typeof entries !== 'object') continue;
-        if (bucket === 'users' && Object.keys(entries).some((key) => key.startsWith('persona:'))) return true;
-        if (Object.values(entries).some((entry) => (
-            Array.isArray(entry?.descriptions) || Array.isArray(entry?.references)
-        ))) return true;
-    }
-    return false;
-}
-
-function migrateCharacterReferenceSettings(settings) {
-    if (!characterReferenceSettingsNeedMigration(settings)) return false;
-    const sourceLibrary = settings.characterReferenceLibrary && typeof settings.characterReferenceLibrary === 'object'
-        ? settings.characterReferenceLibrary
-        : {};
-    const library = { characters: {}, users: {} };
-
-    for (const bucket of ['characters', 'users']) {
-        const entries = sourceLibrary[bucket] && typeof sourceLibrary[bucket] === 'object'
-            ? sourceLibrary[bucket]
-            : {};
-        for (const [rawKey, rawEntry] of Object.entries(entries)) {
-            const key = migratedCharacterLibraryKey(bucket, rawKey);
-            if (!key) continue;
-            const entry = migrateCharacterLibraryEntry(rawEntry, bucket, key);
-            library[bucket][key] = mergeCharacterLibraryEntries(library[bucket][key], entry);
-        }
-    }
-
-    const descriptions = settings.characterReferenceDescriptions;
-    if (descriptions && typeof descriptions === 'object') {
-        for (const bucket of ['characters', 'users']) {
-            const values = descriptions[bucket] && typeof descriptions[bucket] === 'object'
-                ? descriptions[bucket]
-                : {};
-            const displayNames = descriptions.displayNames?.[bucket]
-                && typeof descriptions.displayNames[bucket] === 'object'
-                ? descriptions.displayNames[bucket]
-                : {};
-            const keys = new Set([...Object.keys(values), ...Object.keys(displayNames)]);
-            let index = 0;
-            for (const rawKey of keys) {
-                const key = migratedCharacterLibraryKey(bucket, rawKey);
-                if (!key) continue;
-                const entry = library[bucket][key] || migrateCharacterLibraryEntry({}, bucket, key);
-                const displayName = String(displayNames[rawKey] || '').trim();
-                if (displayName && !entry.displayName) entry.displayName = displayName;
-                const description = String(values[rawKey] || '').trim();
-                if (description) {
-                    appendUniqueAppearanceItem(entry.appearanceItems, {
-                        id: migratedAppearanceItemId('text', bucket, key, index),
-                        type: 'text',
-                        enabled: true,
-                        imagePath: '',
-                        description,
-                    });
-                }
-                library[bucket][key] = entry;
-                index += 1;
-            }
-        }
-        delete settings.characterReferenceDescriptions;
-    }
-
-    settings.characterReferenceLibrary = library;
-    return true;
-}
+export const DEFAULT_NOVELAI_NEGATIVE_PROMPT = 'low quality, worst quality, bad quality, normal quality, jpeg artifacts, signature, watermark, username, artist name, text, letters, blurry, ugly, deformed, disfigured, poor anatomy, bad anatomy, malformed hands, mutated hands, extra fingers, fewer fingers, poorly drawn hands, extra limbs, missing limbs, long neck, bad proportions, mutated, mutation, poorly drawn face, bad eyes, cross-eyed, asymmetrical eyes, cloned face, duplicate, bots';
 
 // ----- Logger -----
 
 const MAX_LOG_ENTRIES = 200;
 const logBuffer = [];
 
-function describeErrorLike(value) {
-    if (value instanceof Error) {
-        const bits = [`${value.name || 'Error'}: ${value.message}`];
-        if (value.code !== undefined) bits.push(`code=${value.code}`);
-        if (value.cause !== undefined && value.cause !== null) {
-            bits.push(`cause=${describeErrorLike(value.cause)}`);
-        }
-        return bits.join(' ');
-    }
-    if (value && typeof value === 'object') {
-        try {
-            return JSON.stringify(value);
-        } catch {
-            return String(value);
-        }
-    }
-    return String(value);
-}
-
-function formatLogArg(a) {
-    if (a instanceof Error) {
-        const parts = [`${a.name || 'Error'}: ${a.message}`];
-        for (const key of ['code', 'status', 'providerId']) {
-            if (a[key] !== undefined && a[key] !== null) {
-                parts.push(`${key}=${a[key]}`);
-            }
-        }
-        if (a.cause !== undefined && a.cause !== null) {
-            parts.push(`cause=${describeErrorLike(a.cause)}`);
-        }
-        if (a.stack) parts.push(a.stack);
-        return parts.join('\n');
-    }
-    if (typeof a === 'object' && a !== null) {
-        try {
-            return JSON.stringify(a);
-        } catch {
-            return String(a);
-        }
-    }
-    return String(a);
-}
-
 export function iigLog(level, ...args) {
     const timestamp = new Date().toISOString();
-    const message = args.map(formatLogArg).join(' ');
+    const message = args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ');
     const entry = `[${timestamp}] [${level}] ${message}`;
 
     logBuffer.push(entry);
@@ -270,14 +66,16 @@ export function exportLogs() {
 export const defaultSettings = Object.freeze({
     enabled: true,
     externalBlocks: false,
-    processUserMessages: false,
     imageContextEnabled: false,
     imageContextCount: 1,
-    imageActionsEnabled: true,
-    imageActionsOpacity: 80,
     styles: [],
     activeStyleId: '',
-    apiType: 'openai', // 'openai' | 'xai' | 'gemini' | 'openrouter' | 'electronhub' | 'naistera' | 'a1111'
+    prefixes: [],
+    activePrefixId: '',
+    suffixes: [],
+    activeSuffixId: '',
+    styleTags: ['GPT', 'Nano Banana', 'NovelAI', 'character', 'girl', 'boy', 'lighting'],
+    apiType: 'openai', // 'openai' | 'gemini' | 'openrouter' | 'electronhub' | 'naistera' | 'void' | 'aigate' | 'novelai'
     endpoint: '',
     /**
      * Если true — endpoint используется «как есть» для генерации (никаких
@@ -295,46 +93,61 @@ export const defaultSettings = Object.freeze({
     // Nano-banana specific
     sendCharAvatar: false,
     sendUserAvatar: false,
-    useActiveUserPersonaAvatar: false,
+    optionalAvatarSending: false,
+    useActiveUserPersonaAvatar: true,
     userAvatarFile: '', // Selected user avatar filename from /User Avatars/
     aspectRatio: '1:1', // "1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"
+    overrideAspectRatio: false,
     imageSize: '1K', // "1K", "2K", "4K"
-    // xAI Imagine
-    xaiAspectRatio: '1:1',
-    xaiResolution: '1k',
-    xaiQuality: 'medium',
+    overrideImageSize: false,
     // Naistera specific
     naisteraAspectRatio: '1:1',
-    naisteraModel: '',
-    naisteraNegativePrompt: '',
-    naisteraCharacterDescriptionsMode: 'as-is',
+    naisteraModel: 'nano-banana-2',
     naisteraSendCharAvatar: false,
     naisteraSendUserAvatar: false,
     naisteraVideoTest: false,
     naisteraVideoEveryN: 1,
-    naisteraPolling: false,
-    naisteraPollIntervalMs: 3000,
-    naisteraPollTimeoutMs: 600000,
-    // A1111 / Forge specific (txt2img only — references not supported)
-    a1111Width: 512,
-    a1111Height: 512,
-    a1111Steps: 20,
-    a1111CfgScale: 7,
-    a1111Sampler: 'Euler a',
-    a1111Scheduler: 'Automatic',
-    a1111Vae: '',
-    a1111HrUpscaler: '',
-    a1111HrScale: 2.0,
-    a1111DenoisingStrength: 0.7,
-    a1111HrSecondPassSteps: 0,
-    a1111ClipSkip: 1,
-    a1111RestoreFaces: false,
-    a1111EnableHr: false,
-    a1111AdetailerFace: false,
-    a1111Resolution: '',
-    a1111PromptPrefix: '',
-    a1111NegativePrompt: '',
-    a1111Seed: -1,
+    // ElectronHub specific
+    electronhubStyle: '', // 'vivid', 'natural', etc. - model-specific styles
+    electronhubNegativePrompt: '',
+    electronhubGuidanceScale: 7.5,
+    electronhubSteps: 50,
+    electronhubEnableReferences: false, // Experimental: try to use /v1/images/edits with references
+    // NovelAI specific (via ST server proxy)
+    novelaiModel: 'nai-diffusion-4-5-full',
+    novelaiCustomModel: '',
+    novelaiSampler: 'k_euler_ancestral',
+    novelaiScheduler: 'karras',
+    novelaiSteps: 28,
+    novelaiScale: 5,
+    novelaiSize: 'Portrait',
+    novelaiNegativePrompt: DEFAULT_NOVELAI_NEGATIVE_PROMPT,
+    novelaiNegativePresets: [{
+        id: 'novelai-negative-default',
+        name: 'Default quality / anatomy',
+        value: DEFAULT_NOVELAI_NEGATIVE_PROMPT,
+        favorite: false,
+        enabled: true,
+        createdAt: 0,
+        tags: [],
+    }],
+    activeNovelaiNegativePresetId: 'novelai-negative-default',
+    novelaiAnlasGuard: true,
+    novelaiDecrisper: false,
+    novelaiVarietyBoost: false,
+    novelaiSm: false,
+    novelaiSmDyn: false,
+    novelaiEnableReferences: true,
+    novelaiReferenceType: 'character&style',
+    novelaiReferenceStrength: 1,
+    novelaiReferenceFidelity: 0.75,
+    // NovelAI tag presets — text substitutions for character/object names in prompts.
+    novelaiPresets: [],
+    activeNovelaiPresetId: '',
+    // Устаревшее поле: хранилось плоским массивом до v2.0-D.1. Сейчас это
+    // refs первого лорбука. При старте `migrateAdditionalReferencesToLorebook`
+    // перекладывает его в `lorebooks[0]` и очищает здесь.
+    additionalReferences: [],
     // Лорбуки — коллекции ref-записей. У каждого свой `enabled` (matcher
     // собирает refs из всех enabled одновременно). `activeLorebookId` хранит
     // тот, что открыт для редактирования в UI-секции References.
@@ -345,23 +158,65 @@ export const defaultSettings = Object.freeze({
     // (не привязан к connection profile).
     refInstructionEnabled: true,
     refInstruction: DEFAULT_REF_INSTRUCTION,
-    // Контролирует отправку текстовых описаний матчнутых лорбук-референсов в
-    // image-prompt. По дефолту ON: описания помогают модели понять кого/что
-    // именно изображать, особенно когда сами картинки референсов слабо
-    // соответствуют запросу.
-    sendRefDescriptions: true,
-    additionalReferencesMode: 'simple',
-    // Character and persona appearance libraries. Each entry has a main
-    // reference and a unified list of text descriptions and image references.
-    characterReferenceLibrary: {
-        characters: {},
-        users: {},
-    },
     // Connection profiles — именованные snapshot'ы настроек подключения
     // (apiType / endpoint / apiKey / model / provider-specific). Переключение
     // профиля копирует все поля из профиля в settings. См. CONNECTION_FIELDS.
     connectionProfiles: [],
     activeConnectionProfileId: '',
+
+    // ----- Extras (порт из MG) -----
+    // NPC: список с аватаркой+внешностью+алиасами. При совпадении имени в
+    // промпте — аватар добавляется как референс, внешность — текстом.
+    npcList: [],
+    autoDetectNames: true,
+    // Wardrobe v4 (SLAYimages-style): global items, per-character active outfits.
+    swItems: [],
+    swActiveOutfits: {},
+    swMaxDimension: 512,
+    swAutoDescribe: true,
+    swDescribePromptStyle: 'detailed',
+    swDescribeApiFormat: 'auto',
+    swExperimentalCollage: false,
+    swSkipDescriptionWarning: false,
+    swModalWidth: 'normal',
+    swShowHidden: false,
+    swSendOutfitImageBot: true,
+    swSendOutfitImageUser: true,
+    optionalWardrobeSending: false,
+    // Custom avatars (avatar library) — заменяет дефолт из карточки/persona.
+    avatarItems: [],
+    avatarTags: [],
+    activeAvatarChar: null,
+    activeAvatarUser: null,
+    // Unified character/persona reference library from sillyimages-master 2.0.
+    // Legacy avatarItems are kept intact for safe migration/fallback.
+    characterReferenceLibrary: {
+        characters: {},
+        users: {},
+    },
+    activeCustomReferenceProfiles: {
+        char: '',
+        user: '',
+    },
+    legacyAvatarLibraryMigratedIds: [],
+    sendRefDescriptions: true,
+    // Wardrobe injection в LLM-промпт через setExtensionPrompt.
+    injectWardrobeToChat: true,
+    wardrobeInjectionDepth: 1,
+    // Avatar appearance injection — описание внешности активного аватара
+    // инжектится в промпт генерации и/или LLM-контекст (setExtensionPrompt).
+    injectAvatarAppearanceToGeneration: false,
+    injectAvatarAppearanceToChatEnabled: false,
+    avatarAppearanceInjectionDepth: 1,
+    // Vision API для авто-генерации описаний одежды по картинке.
+    visionEndpoint: '',
+    visionApiKey: '',
+    visionModel: '',
+    visionPrompt: '',
+    // Размещение кнопки гардероба: bar | wand | both | hidden.
+    wardrobeButtonPlacement: 'bar',
+    // Legacy key kept for compatibility with older settings.
+    showFloatingWardrobeBtn: false,
 });
 
 // ----- Connection profiles -----
@@ -380,45 +235,93 @@ export const CONNECTION_FIELDS = Object.freeze([
     'size',
     'quality',
     'aspectRatio',
+    'overrideAspectRatio',
     'imageSize',
-    'xaiAspectRatio',
-    'xaiResolution',
-    'xaiQuality',
+    'overrideImageSize',
     'sendCharAvatar',
     'sendUserAvatar',
+    'optionalAvatarSending',
     'useActiveUserPersonaAvatar',
     'userAvatarFile',
     'naisteraAspectRatio',
     'naisteraModel',
-    'naisteraNegativePrompt',
-    'naisteraCharacterDescriptionsMode',
     'naisteraSendCharAvatar',
     'naisteraSendUserAvatar',
     'naisteraVideoTest',
     'naisteraVideoEveryN',
-    'naisteraPolling',
-    'naisteraPollIntervalMs',
-    'naisteraPollTimeoutMs',
-    'a1111Width',
-    'a1111Height',
-    'a1111Steps',
-    'a1111CfgScale',
-    'a1111Sampler',
-    'a1111Scheduler',
-    'a1111Vae',
-    'a1111HrUpscaler',
-    'a1111HrScale',
-    'a1111DenoisingStrength',
-    'a1111HrSecondPassSteps',
-    'a1111ClipSkip',
-    'a1111RestoreFaces',
-    'a1111EnableHr',
-    'a1111AdetailerFace',
-    'a1111Resolution',
-    'a1111PromptPrefix',
-    'a1111NegativePrompt',
-    'a1111Seed',
+    'electronhubStyle',
+    'electronhubNegativePrompt',
+    'electronhubGuidanceScale',
+    'electronhubSteps',
+    'electronhubEnableReferences',
+    'novelaiModel',
+    'novelaiCustomModel',
+    'novelaiSampler',
+    'novelaiScheduler',
+    'novelaiSteps',
+    'novelaiScale',
+    'novelaiSize',
+    'novelaiNegativePrompt',
+    'novelaiAnlasGuard',
+    'novelaiDecrisper',
+    'novelaiVarietyBoost',
+    'novelaiSm',
+    'novelaiSmDyn',
+    'novelaiEnableReferences',
+    'novelaiReferenceType',
+    'novelaiReferenceStrength',
+    'novelaiReferenceFidelity',
 ]);
+
+const REMOVED_PROBLEMBO_FIELDS = Object.freeze([
+    'problemboNegativePrompt',
+    'problemboStyle',
+    'problemboSeed',
+    'problemboAspectRatio',
+    'problemboResolution',
+    'problemboEnableReferences',
+]);
+
+/** Удаляет настройки и профили снятого с поддержки провайдера Problembo. */
+export function migrateRemovedProviders(settings = getSettings()) {
+    let changed = false;
+    const profiles = Array.isArray(settings.connectionProfiles) ? settings.connectionProfiles : [];
+    const remainingProfiles = profiles.filter(profile => profile?.apiType !== 'problembo');
+    if (remainingProfiles.length !== profiles.length) {
+        settings.connectionProfiles = remainingProfiles;
+        changed = true;
+    }
+
+    if (settings.apiType === 'problembo') {
+        const fallback = remainingProfiles.find(profile => profile.id === settings.activeConnectionProfileId)
+            || remainingProfiles[0]
+            || null;
+        if (fallback) {
+            for (const key of CONNECTION_FIELDS) settings[key] = fallback[key] ?? defaultSettings[key];
+            settings.activeConnectionProfileId = fallback.id;
+        } else {
+            settings.apiType = 'openai';
+            settings.endpoint = '';
+            settings.rawEndpoint = false;
+            settings.apiKey = '';
+            settings.model = '';
+            settings.activeConnectionProfileId = '';
+        }
+        changed = true;
+    } else if (!remainingProfiles.some(profile => profile.id === settings.activeConnectionProfileId)) {
+        settings.activeConnectionProfileId = remainingProfiles[0]?.id || '';
+    }
+
+    for (const field of REMOVED_PROBLEMBO_FIELDS) {
+        if (Object.hasOwn(settings, field)) {
+            delete settings[field];
+            changed = true;
+        }
+        for (const profile of remainingProfiles) delete profile[field];
+    }
+    if (changed) iigLog('INFO', 'Removed obsolete Problembo provider settings and profiles');
+    return changed;
+}
 
 function makeProfileId() {
     return `iig-profile-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -462,9 +365,11 @@ export function getActiveConnectionProfile(settings = getSettings()) {
 }
 
 /**
- * Creates the initial connection profile from the active connection fields.
+ * Миграция: если connectionProfiles пусты, создаёт `Default` профиль
+ * со snapshot'ом текущих top-level connection-полей. Вызывать однократно
+ * при инициализации.
  */
-export function initializeConnectionProfiles(settings = getSettings()) {
+export function migrateConnectionProfilesFromLegacy(settings = getSettings()) {
     ensureConnectionProfiles(settings);
     if (settings.connectionProfiles.length > 0) {
         return;
@@ -561,22 +466,61 @@ export const VIDEO_MODEL_KEYWORDS = [
 
 // ----- Endpoint constants (UI + provider helpers) -----
 
+// Public-catalog fallback for places that cannot load models asynchronously.
+// The main API settings UI loads the live catalog from Naistera's /api/models.
+export const NAISTERA_MODELS = Object.freeze([
+    'nano-banana-2',
+    'nano-banana-2-lite',
+    'novelai-v4.5',
+    'novelai-v5',
+]);
+export const NOVELAI_MODELS = Object.freeze([
+    { value: 'nai-diffusion-5-full', text: 'NAI Diffusion V5 (Full)' },
+    { value: 'nai-diffusion-5-curated', text: 'NAI Diffusion V5 (Curated)' },
+    { value: 'nai-diffusion-4-5-full', text: 'NAI Diffusion V4.5 (Full)' },
+    { value: 'nai-diffusion-4-5-curated', text: 'NAI Diffusion V4.5 (Curated)' },
+    { value: 'nai-diffusion-4-full', text: 'NAI Diffusion V4 (Full)' },
+    { value: 'nai-diffusion-4-curated-preview', text: 'NAI Diffusion V4 (Curated)' },
+    { value: 'nai-diffusion-3', text: 'NAI Diffusion V3' },
+    { value: 'nai-diffusion-furry-3', text: 'NAI Diffusion Furry V3' },
+    { value: '__custom__', text: 'NovelAI V5 / Custom model ID' },
+]);
+
+export const NOVELAI_SAMPLERS = Object.freeze([
+    'k_euler', 'k_euler_ancestral', 'k_dpmpp_2s_ancestral',
+    'k_dpmpp_2m', 'k_dpmpp_2m_sde', 'k_dpmpp_sde', 'ddim',
+]);
+
+export const NOVELAI_SCHEDULERS = Object.freeze([
+    'native', 'karras', 'exponential', 'polyexponential',
+]);
+
+export const NOVELAI_SIZES = Object.freeze([
+    { value: 'Portrait', text: 'Portrait (832×1216)', width: 832, height: 1216 },
+    { value: 'Landscape', text: 'Landscape (1216×832)', width: 1216, height: 832 },
+    { value: 'Square', text: 'Square (1024×1024)', width: 1024, height: 1024 },
+]);
+
+export function resolveNovelaiSize(sizeValue) {
+    return NOVELAI_SIZES.find(s => s.value === sizeValue) || NOVELAI_SIZES[0];
+}
+
 export const DEFAULT_ENDPOINTS = Object.freeze({
-    xai: 'https://api.x.ai',
     naistera: 'https://naistera.org',
     openrouter: 'https://openrouter.ai/api/v1',
     electronhub: 'https://api.electronhub.ai',
-    a1111: 'http://127.0.0.1:7860',
+    void: 'https://api.voidai.app',
+    aigate: 'https://api.aigate.shop',
 });
 
 export const ENDPOINT_PLACEHOLDERS = Object.freeze({
     openai: 'https://api.openai.com',
-    xai: 'https://api.x.ai',
     gemini: 'https://generativelanguage.googleapis.com',
     openrouter: 'https://openrouter.ai/api/v1',
     electronhub: 'https://api.electronhub.ai',
     naistera: 'https://naistera.org',
-    a1111: 'http://127.0.0.1:7860',
+    void: 'https://api.voidai.app',
+    aigate: 'https://api.aigate.shop',
 });
 
 // ----- Settings accessors -----
@@ -592,25 +536,27 @@ export function getSettings() {
         context.extensionSettings[MODULE_NAME] = structuredClone(defaultSettings);
     }
 
-    const characterReferencesMigrated = migrateCharacterReferenceSettings(context.extensionSettings[MODULE_NAME]);
+    const needsNovelaiNegativeDefaults = !Object.hasOwn(
+        context.extensionSettings[MODULE_NAME],
+        'novelaiNegativePresets',
+    );
 
     // Ensure all default keys exist
     for (const key of Object.keys(defaultSettings)) {
         if (!Object.hasOwn(context.extensionSettings[MODULE_NAME], key)) {
-            const defaultValue = defaultSettings[key];
-            context.extensionSettings[MODULE_NAME][key] = defaultValue && typeof defaultValue === 'object'
-                ? structuredClone(defaultValue)
-                : defaultValue;
+            context.extensionSettings[MODULE_NAME][key] = defaultSettings[key];
         }
     }
 
-    for (const key of NON_SCHEMA_SETTING_KEYS) {
-        delete context.extensionSettings[MODULE_NAME][key];
+    if (needsNovelaiNegativeDefaults) {
+        context.extensionSettings[MODULE_NAME].novelaiNegativePresets = structuredClone(defaultSettings.novelaiNegativePresets);
+        context.extensionSettings[MODULE_NAME].activeNovelaiNegativePresetId = 'novelai-negative-default';
+        if (!String(context.extensionSettings[MODULE_NAME].novelaiNegativePrompt || '').trim()) {
+            context.extensionSettings[MODULE_NAME].novelaiNegativePrompt = DEFAULT_NOVELAI_NEGATIVE_PROMPT;
+        }
     }
 
-    if (characterReferencesMigrated) {
-        context.saveSettingsDebounced();
-    }
+    migrateNovelaiPresetsFormat(context.extensionSettings[MODULE_NAME]);
 
     return context.extensionSettings[MODULE_NAME];
 }
@@ -623,15 +569,28 @@ export function saveSettings() {
 // ----- Naistera helpers (знают про настройки, но не про провайдеров) -----
 
 export function normalizeNaisteraModel(model) {
-    return String(model || '').trim();
+    const raw = String(model || '').trim().toLowerCase();
+    if (!raw) return '';
+    if (raw === 'grok pro') return 'grok-pro';
+    if (raw === 'grok-pro') return 'grok-pro';
+    if (raw === 'grok-imagine-pro') return 'grok-pro';
+    if (raw === 'imagine-pro') return 'grok-pro';
+    if (raw === 'nano-banana' || raw === 'nano banana') return 'nano-banana-2';
+    if (raw === 'nano-banana-pro' || raw === 'nano banana pro') return 'nano-banana-2';
+    if (raw === 'nano banana 2') return 'nano-banana-2';
+    if (raw === 'nano banana 2 lite') return 'nano-banana-2-lite';
+    if (raw === 'novel ai' || raw === 'novelai') return 'novelai-v5';
+    return raw;
 }
 
-export function isNaisteraNovelAIModel(model) {
-    return /^novelai(?:-|$)/i.test(normalizeNaisteraModel(model));
+export function naisteraModelSupportsReferences(model) {
+    const normalized = normalizeNaisteraModel(model);
+    return Boolean(normalized) && !normalized.startsWith('novelai') && normalized !== 'grok-pro';
 }
 
-export function normalizeNaisteraCharacterDescriptionsMode(value) {
-    return ['none', 'as-is', 'character-prompt'].includes(value) ? value : 'as-is';
+export function shouldUseNaisteraVideoTest(model) {
+    const normalized = normalizeNaisteraModel(model);
+    return normalized === 'grok' || normalized === 'grok-pro' || normalized.startsWith('nano-banana');
 }
 
 export function normalizeNaisteraVideoFrequency(value) {
@@ -670,6 +629,48 @@ export function shouldTriggerNaisteraVideoForMessage(messageId, everyN) {
     return ordinal % normalizedEveryN === 0;
 }
 
+// ----- NovelAI presets helpers -----
+
+/**
+ * Migration: old presets had { id, name, tags: string } where `tags` was
+ * the replacement text. New format uses `value` for content and `tags` as
+ * classification array (like styles). Run before factory ensure.
+ */
+export function migrateNovelaiPresetsFormat(settings = getSettings()) {
+    if (!Array.isArray(settings.novelaiPresets)) return;
+    let migrated = false;
+    for (const raw of settings.novelaiPresets) {
+        if (!raw || typeof raw !== 'object') continue;
+        if (typeof raw.tags === 'string' && !Object.hasOwn(raw, 'value')) {
+            raw.value = raw.tags;
+            raw.tags = [];
+            raw.favorite = false;
+            raw.createdAt = raw.createdAt || 0;
+            migrated = true;
+        }
+    }
+    if (migrated) iigLog('INFO', 'Migrated NovelAI presets to new format (tags string → value)');
+}
+
+/**
+ * Applies preset substitutions to a prompt string.
+ * For each preset, replaces occurrences of the trigger word (case-insensitive,
+ * whole word) with the preset's value (replacement text).
+ */
+export function applyNovelaiPresets(prompt, settings = getSettings()) {
+    const presets = ensureNovelaiPresets(settings);
+    if (presets.length === 0) return prompt;
+
+    let result = prompt;
+    for (const preset of presets) {
+        if (!preset.enabled || !preset.name || !preset.value) continue;
+        const escaped = preset.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const regex = new RegExp(`\\b${escaped}\\b`, 'gi');
+        result = result.replace(regex, preset.value);
+    }
+    return result;
+}
+
 // ----- Endpoint normalization -----
 
 export function getEndpointPlaceholder(apiType) {
@@ -679,19 +680,17 @@ export function getEndpointPlaceholder(apiType) {
 export function normalizeConfiguredEndpoint(apiType, endpoint) {
     const trimmed = String(endpoint || '').trim().replace(/\/+$/, '');
     if (!trimmed) {
-        if (apiType === 'xai') return DEFAULT_ENDPOINTS.xai;
         if (apiType === 'naistera') return DEFAULT_ENDPOINTS.naistera;
+        if (apiType === 'void') return DEFAULT_ENDPOINTS.void;
         if (apiType === 'openrouter') return DEFAULT_ENDPOINTS.openrouter;
         if (apiType === 'electronhub') return DEFAULT_ENDPOINTS.electronhub;
-        if (apiType === 'a1111') return DEFAULT_ENDPOINTS.a1111;
+        if (apiType === 'aigate') return DEFAULT_ENDPOINTS.aigate;
         return '';
     }
     if (apiType === 'naistera') {
-        return trimmed.replace(/\/api\/(?:generate|models)$/i, '');
+        return trimmed.replace(/\/api\/generate$/i, '');
     }
-    if (apiType === 'xai') {
-        return trimmed.replace(/\/v1$/i, '');
-    }
+
     return trimmed;
 }
 
@@ -725,15 +724,90 @@ export function getEffectiveEndpoint(settings = getSettings()) {
 
 // ----- Styles -----
 
+export function ensureStyleTags(settings = getSettings()) {
+    if (!Array.isArray(settings.styleTags)) {
+        settings.styleTags = ['GPT', 'Nano Banana', 'NovelAI'];
+    }
+    settings.styleTags = settings.styleTags
+        .map((tag) => String(tag || '').trim())
+        .filter(Boolean);
+    if (settings.styleTags.length === 0) {
+        settings.styleTags = ['GPT', 'Nano Banana', 'NovelAI'];
+    }
+    return settings.styleTags;
+}
+
+export function addStyleTag(tagName, settings = getSettings()) {
+    const tags = ensureStyleTags(settings);
+    const name = String(tagName || '').trim();
+    if (!name) return false;
+    if (tags.some((t2) => t2.toLowerCase() === name.toLowerCase())) return false;
+    tags.push(name);
+    return true;
+}
+
+export function removeStyleTag(tagName, settings = getSettings()) {
+    const tags = ensureStyleTags(settings);
+    const idx = tags.findIndex((t2) => t2 === tagName);
+    if (idx === -1) return false;
+    tags.splice(idx, 1);
+    for (const style of ensureStyles(settings)) {
+        const si = style.tags.indexOf(tagName);
+        if (si !== -1) style.tags.splice(si, 1);
+    }
+    return true;
+}
+
+// ---- Avatar tags ----
+
+export function ensureAvatarTags(settings = getSettings()) {
+    if (!Array.isArray(settings.avatarTags)) settings.avatarTags = [];
+    settings.avatarTags = settings.avatarTags.map((t) => String(t || '').trim()).filter(Boolean);
+    return settings.avatarTags;
+}
+
+export function addAvatarTag(tagName, settings = getSettings()) {
+    const tags = ensureAvatarTags(settings);
+    const name = String(tagName || '').trim();
+    if (!name || tags.some((t) => t.toLowerCase() === name.toLowerCase())) return false;
+    tags.push(name);
+    return true;
+}
+
+export function removeAvatarTag(tagName, settings = getSettings()) {
+    const tags = ensureAvatarTags(settings);
+    const idx = tags.findIndex((t) => t === tagName);
+    if (idx === -1) return false;
+    tags.splice(idx, 1);
+    const items = Array.isArray(settings.avatarItems) ? settings.avatarItems : [];
+    for (const item of items) {
+        if (!Array.isArray(item.tags)) continue;
+        const si = item.tags.indexOf(tagName);
+        if (si !== -1) item.tags.splice(si, 1);
+    }
+    return true;
+}
+
 export function ensureStyles(settings = getSettings()) {
     if (!Array.isArray(settings.styles)) {
-        settings.styles = [];
+        const migratedPresets = Array.isArray(settings.stylePresets) ? settings.stylePresets : [];
+        settings.styles = migratedPresets.map((preset) => ({
+            id: String(preset?.id || `iig-style-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`),
+            name: String(preset?.name || '').trim(),
+            value: String(preset?.style || '').trim(),
+            favorite: false,
+            createdAt: 0,
+            tags: [],
+        }));
     }
 
     settings.styles = settings.styles.map((style, index) => ({
         id: String(style?.id || `iig-style-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 8)}`),
         name: String(style?.name || t`Style ${index + 1}`).trim() || t`Style ${index + 1}`,
-        value: String(style?.value || '').trim(),
+        value: String(style?.value ?? style?.style ?? '').trim(),
+        favorite: style?.favorite === true,
+        createdAt: Number.isFinite(style?.createdAt) ? style.createdAt : 0,
+        tags: Array.isArray(style?.tags) ? style.tags.filter((t2) => typeof t2 === 'string' && t2.trim()) : [],
     }));
 
     if (!settings.styles.some((style) => style.id === settings.activeStyleId)) {
@@ -750,8 +824,20 @@ export function createStyle(name = '') {
         id: `iig-style-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
         name: String(name || '').trim() || t`Style ${styles.length + 1}`,
         value: '',
+        favorite: false,
+        createdAt: Date.now(),
+        tags: [],
     };
     styles.push(style);
+    settings.activeStyleId = style.id;
+    return style;
+}
+
+export function toggleStyleFavorite(styleId) {
+    const settings = getSettings();
+    const style = ensureStyles(settings).find((item) => item.id === styleId);
+    if (!style) return null;
+    style.favorite = !style.favorite;
     return style;
 }
 
@@ -773,6 +859,12 @@ export function updateStyle(styleId, patch) {
     if (Object.hasOwn(patch, 'value')) {
         style.value = String(patch.value || '').trim();
     }
+    if (Object.hasOwn(patch, 'favorite')) {
+        style.favorite = Boolean(patch.favorite);
+    }
+    if (Object.hasOwn(patch, 'tags') && Array.isArray(patch.tags)) {
+        style.tags = patch.tags.filter((t2) => typeof t2 === 'string' && t2.trim());
+    }
 
     return style;
 }
@@ -787,10 +879,122 @@ export function removeStyle(styleId) {
 
     styles.splice(index, 1);
     if (settings.activeStyleId === styleId) {
-        settings.activeStyleId = '';
+        settings.activeStyleId = styles[0]?.id || '';
     }
     return true;
 }
+
+// ----- Generic preset CRUD factory (prefixes / suffixes) -----
+
+function makePresetOps(collectionKey, activeIdKey, label) {
+    function ensure(settings = getSettings()) {
+        if (!Array.isArray(settings[collectionKey])) {
+            settings[collectionKey] = [];
+        }
+        settings[collectionKey] = settings[collectionKey].map((raw, index) => ({
+            id: String(raw?.id || `iig-${collectionKey}-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 8)}`),
+            name: String(raw?.name || `${label} ${index + 1}`).trim() || `${label} ${index + 1}`,
+            value: String(raw?.value ?? '').trim(),
+            favorite: raw?.favorite === true,
+            enabled: raw?.enabled !== false,
+            createdAt: Number.isFinite(raw?.createdAt) ? raw.createdAt : 0,
+            tags: Array.isArray(raw?.tags) ? raw.tags.filter((t2) => typeof t2 === 'string' && t2.trim()) : [],
+        }));
+        if (!settings[collectionKey].some((item) => item.id === settings[activeIdKey])) {
+            settings[activeIdKey] = '';
+        }
+        return settings[collectionKey];
+    }
+
+    function create(name = '') {
+        const settings = getSettings();
+        const items = ensure(settings);
+        const item = {
+            id: `iig-${collectionKey}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+            name: String(name || '').trim() || `${label} ${items.length + 1}`,
+            value: '',
+            favorite: false,
+            enabled: true,
+            createdAt: Date.now(),
+            tags: [],
+        };
+        items.push(item);
+        settings[activeIdKey] = item.id;
+        return item;
+    }
+
+    function getActive(settings = getSettings()) {
+        const items = ensure(settings);
+        return items.find((item) => item.id === settings[activeIdKey]) || null;
+    }
+
+    function update(id, patch) {
+        const settings = getSettings();
+        const item = ensure(settings).find((i) => i.id === id);
+        if (!item) return null;
+        if (Object.hasOwn(patch, 'name')) item.name = String(patch.name || '').trim() || item.name;
+        if (Object.hasOwn(patch, 'value')) item.value = String(patch.value || '').trim();
+        if (Object.hasOwn(patch, 'favorite')) item.favorite = Boolean(patch.favorite);
+        if (Object.hasOwn(patch, 'enabled')) item.enabled = Boolean(patch.enabled);
+        if (Object.hasOwn(patch, 'tags') && Array.isArray(patch.tags)) {
+            item.tags = patch.tags.filter((t2) => typeof t2 === 'string' && t2.trim());
+        }
+        return item;
+    }
+
+    function remove(id) {
+        const settings = getSettings();
+        const items = ensure(settings);
+        const index = items.findIndex((i) => i.id === id);
+        if (index === -1) return false;
+        items.splice(index, 1);
+        if (settings[activeIdKey] === id) {
+            settings[activeIdKey] = items[0]?.id || '';
+        }
+        return true;
+    }
+
+    function toggleFavorite(id) {
+        const settings = getSettings();
+        const item = ensure(settings).find((i) => i.id === id);
+        if (!item) return null;
+        item.favorite = !item.favorite;
+        return item;
+    }
+
+    return { ensure, create, getActive, update, remove, toggleFavorite };
+}
+
+const _prefixOps = makePresetOps('prefixes', 'activePrefixId', 'Prefix');
+export const ensurePrefixes = _prefixOps.ensure;
+export const createPrefix = _prefixOps.create;
+export const getActivePrefix = _prefixOps.getActive;
+export const updatePrefix = _prefixOps.update;
+export const removePrefix = _prefixOps.remove;
+export const togglePrefixFavorite = _prefixOps.toggleFavorite;
+
+const _suffixOps = makePresetOps('suffixes', 'activeSuffixId', 'Suffix');
+export const ensureSuffixes = _suffixOps.ensure;
+export const createSuffix = _suffixOps.create;
+export const getActiveSuffix = _suffixOps.getActive;
+export const updateSuffix = _suffixOps.update;
+export const removeSuffix = _suffixOps.remove;
+export const toggleSuffixFavorite = _suffixOps.toggleFavorite;
+
+const _naiPresetOps = makePresetOps('novelaiPresets', 'activeNovelaiPresetId', 'NAI Preset');
+export const ensureNovelaiPresets = _naiPresetOps.ensure;
+export const createNovelaiPreset = _naiPresetOps.create;
+export const getActiveNovelaiPreset = _naiPresetOps.getActive;
+export const updateNovelaiPreset = _naiPresetOps.update;
+export const removeNovelaiPreset = _naiPresetOps.remove;
+export const toggleNovelaiPresetFavorite = _naiPresetOps.toggleFavorite;
+
+const _naiNegativePresetOps = makePresetOps('novelaiNegativePresets', 'activeNovelaiNegativePresetId', 'Negative preset');
+export const ensureNovelaiNegativePresets = _naiNegativePresetOps.ensure;
+export const createNovelaiNegativePreset = _naiNegativePresetOps.create;
+export const getActiveNovelaiNegativePreset = _naiNegativePresetOps.getActive;
+export const updateNovelaiNegativePreset = _naiNegativePresetOps.update;
+export const removeNovelaiNegativePreset = _naiNegativePresetOps.remove;
 
 // ----- Last request snapshot (in-memory, NOT persisted) -----
 
@@ -802,7 +1006,6 @@ export function removeStyle(styleId) {
  * @type {null | {
  *   timestamp: number,
  *   prompt: string,
- *   negativePrompt?: string,
  *   references: Array<{ dataUrl: string, label: string }>,
  *   metadata: {
  *     provider: string,
@@ -951,6 +1154,32 @@ export function ensureLorebooks(settings = getSettings()) {
 }
 
 /**
+ * One-time migration из старого `settings.additionalReferences` (flat array)
+ * в `settings.lorebooks[0]`. Вызывается из init. Идемпотентно.
+ */
+export function migrateAdditionalReferencesToLorebook(settings = getSettings()) {
+    ensureLorebooks(settings);
+
+    const legacyRefs = Array.isArray(settings.additionalReferences) ? settings.additionalReferences : [];
+    if (legacyRefs.length === 0) {
+        settings.additionalReferences = [];
+        return;
+    }
+
+    // Переливаем в refs первого лорбука (обычно «My library»). Существующие
+    // refs в лорбуке сохраняются, legacy добавляются в конец (не перезаписывают).
+    const target = settings.lorebooks[0];
+    const existingIds = new Set(target.refs.map((r) => r.id));
+    const migrated = normalizeReferencesArrayInternal(legacyRefs)
+        .filter((r) => !existingIds.has(r.id));
+    target.refs = target.refs.concat(migrated).slice(0, MAX_ADDITIONAL_REFERENCES);
+
+    // Очищаем legacy-поле после успешной миграции.
+    settings.additionalReferences = [];
+    iigLog('INFO', `Migrated ${migrated.length} additional references to lorebook "${target.name}"`);
+}
+
+/**
  * Возвращает активный лорбук (тот, что редактируется в UI) или первый, если
  * `activeLorebookId` битый. Никогда не возвращает null при валидном settings.
  */
@@ -960,9 +1189,14 @@ export function getActiveLorebook(settings = getSettings()) {
 }
 
 /**
- * Returns the editable reference array of the active lorebook.
+ * Массив refs активного лорбука (read-write: мутация возвращённого массива
+ * изменит state в settings).
+ *
+ * Имя `ensureAdditionalReferencesArray` сохранено ради минимальной diff — до
+ * миграции все consumer-места считали это главным массивом refs. Теперь оно
+ * эквивалентно «refs активного лорбука».
  */
-export function getActiveLorebookReferences(settings = getSettings()) {
+export function ensureAdditionalReferencesArray(settings = getSettings()) {
     const active = getActiveLorebook(settings);
     if (!active) {
         return [];
@@ -971,12 +1205,30 @@ export function getActiveLorebookReferences(settings = getSettings()) {
     return active.refs;
 }
 
-// Book switches apply in power mode; simple mode searches the whole library.
-export function getMatchingLorebooks(settings = getSettings()) {
+// Name used by sillyimages-master 2.0 reference/library modules.
+export function getActiveLorebookReferences(settings = getSettings()) {
+    return ensureAdditionalReferencesArray(settings);
+}
+
+/**
+ * Все refs из всех enabled лорбуков в один плоский массив. Matcher использует
+ * это для поиска совпадений по prompt. Порядок сохраняет: refs внутри лорбука
+ * в исходном порядке, лорбуки — в порядке массива `settings.lorebooks`.
+ *
+ * К каждому ref добавляется «невидимое» поле `_lorebookName` (underscore-
+ * префикс, чтобы не путали с persisted-полями). UI/debug используют это
+ * чтобы показать, из какого лорбука пришёл сматченный ref.
+ */
+export function getAllEnabledLorebookReferences(settings = getSettings()) {
     const lorebooks = ensureLorebooks(settings);
-    return settings.additionalReferencesMode === 'power'
-        ? lorebooks.filter((book) => book.enabled)
-        : lorebooks;
+    const result = [];
+    for (const lb of lorebooks) {
+        if (!lb.enabled) continue;
+        for (const ref of lb.refs) {
+            result.push({ ...ref, _lorebookName: lb.name });
+        }
+    }
+    return result;
 }
 
 /**
@@ -984,7 +1236,7 @@ export function getMatchingLorebooks(settings = getSettings()) {
  * первого появления. Пустая группа ('') не включается.
  */
 export function getAdditionalReferenceGroups(settings = getSettings()) {
-    const refs = getActiveLorebookReferences(settings);
+    const refs = ensureAdditionalReferencesArray(settings);
     const seen = new Set();
     const groups = [];
     for (const ref of refs) {

@@ -9,54 +9,31 @@
  */
 
 import { t } from './i18n.js';
-import { iigLog, getSettings } from './settings.js';
+import { downloadImageSrc } from './utils.js';
 import { regenerateSingleTag } from './pipeline.js';
 
 const IMG_SELECTOR = 'img[data-iig-instruction]';
-
-export function applyImageActionsStyle(settings = getSettings()) {
-    const enabled = settings.imageActionsEnabled !== false;
-    const rawOpacity = Number(settings.imageActionsOpacity);
-    const opacity = Number.isFinite(rawOpacity)
-        ? Math.max(0, Math.min(100, rawOpacity)) / 100
-        : 0.8;
-    document.documentElement.style.setProperty('--iig-actions-opacity', String(opacity));
-    document.body.classList.toggle('iig-actions-hidden', !enabled);
-}
 
 export function initImageActions() {
     const chat = document.getElementById('chat');
     if (!chat) return;
 
-    applyImageActionsStyle();
     scanAndAttach(chat);
 
-    const dirtyRoots = new Set();
-    let scanFrame = null;
-    const scheduleScan = (root) => {
-        dirtyRoots.add(root);
-        if (scanFrame !== null) return;
-        scanFrame = requestAnimationFrame(() => {
-            scanFrame = null;
-            const roots = [...dirtyRoots];
-            dirtyRoots.clear();
-            for (const dirtyRoot of roots) scanAndAttach(dirtyRoot);
-        });
-    };
-
     const observer = new MutationObserver((mutations) => {
+        const dirty = new Set();
         for (const m of mutations) {
             if (m.type === 'childList') {
                 for (const n of m.addedNodes) {
-                    if (!(n instanceof Element)) continue;
-                    if (n.matches?.(IMG_SELECTOR) || n.querySelector?.(IMG_SELECTOR)) {
-                        scheduleScan(n);
-                    }
+                    if (n instanceof Element) dirty.add(n);
                 }
             }
-            if (m.type === 'attributes' && m.target instanceof HTMLImageElement && m.target.matches(IMG_SELECTOR)) {
-                scheduleScan(m.target);
+            if (m.type === 'attributes' && m.target instanceof Element) {
+                dirty.add(m.target);
             }
+        }
+        for (const el of dirty) {
+            scanAndAttach(el);
         }
     });
     observer.observe(chat, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'class'] });
@@ -78,6 +55,22 @@ function scanAndAttach(root) {
 function attachActions(img) {
     if (!img.src || img.src.endsWith('[IMG:GEN]')) return;
 
+    const messageEl = findMessageElement(img);
+    const messageId = messageEl?.getAttribute('mesid');
+    if (messageId !== null && messageId !== undefined && messageId !== '') {
+        img.dataset.iigMessageId = messageId;
+    }
+
+    // Keep a stable source-tag index. When another image in the same message
+    // is replaced by a loading placeholder, live DOM indexes shift.
+    if (!img.dataset.iigTagIndex) {
+        const media = messageEl
+            ? Array.from(messageEl.querySelectorAll('img[data-iig-instruction], video[data-iig-instruction]'))
+            : [];
+        const stableIndex = media.indexOf(img);
+        if (stableIndex >= 0) img.dataset.iigTagIndex = String(stableIndex);
+    }
+
     const isError = img.classList.contains('iig-error-image');
     let host = img.parentElement;
 
@@ -96,6 +89,20 @@ function attachActions(img) {
     host.appendChild(buildActions(img, isError));
 }
 
+function findMessageElement(element) {
+    if (!element) return null;
+    const direct = element.closest?.('.mes[mesid], [mesid]');
+    if (direct) return direct;
+
+    const hostDirect = element.parentElement?.closest?.('.mes[mesid], [mesid]');
+    if (hostDirect) return hostDirect;
+
+    for (const candidate of document.querySelectorAll('#chat [mesid]')) {
+        if (candidate.contains(element)) return candidate;
+    }
+    return null;
+}
+
 function buildActions(img, isError) {
     const actions = document.createElement('div');
     actions.className = 'iig-img-actions';
@@ -109,72 +116,54 @@ function buildActions(img, isError) {
     actions.addEventListener('pointerdown', (e) => e.stopPropagation());
     actions.addEventListener('click', (e) => e.stopPropagation());
 
+    // SillyTavern may replace only the <img> when switching a swipe while
+    // preserving our host and action buttons. Resolve the live image at click
+    // time instead of retaining a reference to the detached previous swipe.
+    const getCurrentImage = () => actions.parentElement
+        ?.querySelector(':scope > img[data-iig-instruction]') || img;
+
     actions.querySelector('.iig-img-download')?.addEventListener('click', async (e) => {
         stopAll(e);
-        await downloadImage(img);
+        await downloadImage(getCurrentImage());
     });
     actions.querySelector('.iig-img-regen')?.addEventListener('click', async (e) => {
         stopAll(e);
-        await regenerateOne(img);
+        await regenerateOne(getCurrentImage());
     });
     actions.querySelector('.iig-img-retry')?.addEventListener('click', async (e) => {
         stopAll(e);
-        await regenerateOne(img);
+        await regenerateOne(getCurrentImage());
     });
 
     return actions;
 }
 
 async function downloadImage(img) {
-    const src = img.src;
-    let url = src;
-    let cleanup = null;
-    if (!src.startsWith('data:')) {
-        try {
-            const resp = await fetch(src);
-            const blob = await resp.blob();
-            url = URL.createObjectURL(blob);
-            cleanup = () => URL.revokeObjectURL(url);
-        } catch (err) {
-            iigLog('ERROR', 'Image download failed:', err);
-            toastr.error(t`Failed to download image`, t`Image Generation`);
-            return;
-        }
+    const ok = await downloadImageSrc(img.src);
+    if (!ok) {
+        toastr.error(t`Failed to download image`, t`Image Generation`);
     }
-    const ext = guessExtension(src);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `iig_${Date.now()}.${ext}`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    if (cleanup) setTimeout(cleanup, 100);
-}
-
-function guessExtension(src) {
-    if (src.startsWith('data:')) {
-        const m = src.match(/^data:image\/([a-z0-9+]+)/i);
-        if (m) return m[1].replace('jpeg', 'jpg');
-    }
-    const m = src.match(/\.([a-z0-9]+)(?:\?|#|$)/i);
-    if (m) return m[1].toLowerCase();
-    return 'png';
 }
 
 async function regenerateOne(img) {
-    const messageEl = img.closest('.mes');
-    if (!messageEl) {
+    const messageEl = findMessageElement(img);
+    const storedMessageId = Number.parseInt(img.dataset.iigMessageId || '', 10);
+    const domMessageId = Number.parseInt(messageEl?.getAttribute('mesid') || '', 10);
+    const messageId = Number.isInteger(storedMessageId) ? storedMessageId : domMessageId;
+    if (!Number.isInteger(messageId)) {
         toastr.error(t`Could not locate message`, t`Image Generation`);
         return;
     }
-    const messageId = parseInt(messageEl.getAttribute('mesid') || '', 10);
-    if (Number.isNaN(messageId)) return;
 
     // tagIndex must match regenerateSingleTag's selector (img + video) so we
     // don't regenerate the wrong tag when a Naistera video precedes the image.
-    const allMedia = Array.from(messageEl.querySelectorAll('img[data-iig-instruction], video[data-iig-instruction]'));
-    const tagIndex = allMedia.indexOf(img);
+    const storedIndex = Number.parseInt(img.dataset.iigTagIndex || '', 10);
+    const allMedia = messageEl
+        ? Array.from(messageEl.querySelectorAll('img[data-iig-instruction], video[data-iig-instruction]'))
+        : [];
+    const tagIndex = Number.isInteger(storedIndex) && storedIndex >= 0 ? storedIndex : allMedia.indexOf(img);
     if (tagIndex < 0) return;
 
-    await regenerateSingleTag(messageId, tagIndex);
+    const instruction = img.getAttribute('data-iig-instruction') || '';
+    await regenerateSingleTag(messageId, tagIndex, instruction);
 }

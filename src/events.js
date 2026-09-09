@@ -22,29 +22,15 @@ export function addRegenerateButton(messageElement, messageId) {
     btn.tabIndex = 0;
     btn.addEventListener('click', async (e) => {
         e.stopPropagation();
-        const liveMesId = parseInt(messageElement.getAttribute('mesid') || '', 10);
-        const targetId = Number.isFinite(liveMesId) ? liveMesId : messageId;
-        if (targetId !== messageId) {
-            iigLog('INFO', `regenerate-btn click: captured messageId=${messageId} differs from live mesid=${liveMesId}; using ${targetId}`);
-        }
-        await regenerateMessageImages(targetId);
+        await regenerateMessageImages(messageId);
     });
 
     extraMesButtons.appendChild(btn);
-
-    // ST hides the "..." hint button on user messages by default. Once we
-    // attach our button, force the hint visible so user can actually open it.
-    const hint = messageElement.querySelector('.extraMesButtonsHint');
-    if (hint instanceof HTMLElement) {
-        hint.style.display = '';
-        hint.style.opacity = '';
-    }
 }
 
 export function addButtonsToExistingMessages() {
     const context = SillyTavern.getContext();
     if (!context.chat || context.chat.length === 0) return;
-    const settings = getSettings();
 
     const messageElements = document.querySelectorAll('#chat .mes');
     let addedCount = 0;
@@ -55,19 +41,18 @@ export function addButtonsToExistingMessages() {
 
         const messageId = parseInt(mesId, 10);
         const message = context.chat[messageId];
-        if (!message) continue;
 
-        // AI messages always; user messages only if processUserMessages is on.
-        if (message.is_user && !settings.processUserMessages) continue;
-
-        addRegenerateButton(messageElement, messageId);
-        addedCount++;
+        // Only add to AI messages (not user messages)
+        if (message && !message.is_user) {
+            addRegenerateButton(messageElement, messageId);
+            addedCount++;
+        }
     }
 
     iigLog('INFO', `Added regenerate buttons to ${addedCount} existing messages`);
 }
 
-// ----- Message rendered handlers -----
+// ----- CHARACTER_MESSAGE_RENDERED handler -----
 
 export async function onMessageReceived(messageId) {
     iigLog('INFO', `onMessageReceived: ${messageId}`);
@@ -78,23 +63,15 @@ export async function onMessageReceived(messageId) {
         return;
     }
 
+    const context = SillyTavern.getContext();
+    const _message = context.chat[messageId];
+
     const messageElement = document.querySelector(`#chat .mes[mesid="${messageId}"]`);
     if (!messageElement) return;
 
+    // Always add regenerate button for AI messages
     addRegenerateButton(messageElement, messageId);
-    await processMessageTags(messageId);
-}
 
-export async function onUserMessageRendered(messageId) {
-    const settings = getSettings();
-    if (!settings.enabled) return;
-    if (!settings.processUserMessages) return;
-
-    iigLog('INFO', `onUserMessageRendered: ${messageId}`);
-    const messageElement = document.querySelector(`#chat .mes[mesid="${messageId}"]`);
-    if (!messageElement) return;
-
-    addRegenerateButton(messageElement, messageId);
     await processMessageTags(messageId);
 }
 
@@ -103,29 +80,29 @@ export async function onUserMessageRendered(messageId) {
 export function subscribeEvents() {
     const context = SillyTavern.getContext();
 
+    // Debug: log available event types
     console.log('[IIG] Available event_types:', context.event_types);
     console.log('[IIG] CHARACTER_MESSAGE_RENDERED:', context.event_types.CHARACTER_MESSAGE_RENDERED);
     console.log('[IIG] MESSAGE_SWIPED:', context.event_types.MESSAGE_SWIPED);
 
+    // When chat is loaded/changed, add buttons to all existing messages.
     context.eventSource.on(context.event_types.CHAT_CHANGED, () => {
         iigLog('INFO', 'CHAT_CHANGED event - adding buttons to existing messages');
-        setTimeout(() => addButtonsToExistingMessages(), 100);
+        setTimeout(() => {
+            addButtonsToExistingMessages();
+        }, 100);
     });
 
+    // Wrapper to add debug logging
     const handleMessage = async (messageId) => {
         console.log('[IIG] Event triggered for message:', messageId);
         await onMessageReceived(messageId);
     };
 
+    // Listen for new messages AFTER they're rendered in DOM.
+    // CHARACTER_MESSAGE_RENDERED fires after addOneMessage() completes.
+    // This is the ONLY event we handle — no auto-retry on swipe/update.
     context.eventSource.makeLast(context.event_types.CHARACTER_MESSAGE_RENDERED, handleMessage);
-
-    // User-message processing is opt-in via processUserMessages — handler early-exits when off.
-    if (context.event_types.USER_MESSAGE_RENDERED) {
-        context.eventSource.makeLast(context.event_types.USER_MESSAGE_RENDERED, async (messageId) => {
-            console.log('[IIG] USER_MESSAGE_RENDERED:', messageId);
-            await onUserMessageRendered(messageId);
-        });
-    }
 
     // NOTE: We intentionally DO NOT handle MESSAGE_SWIPED or MESSAGE_UPDATED.
     // Swipe = user wants NEW content, not to retry old error images.

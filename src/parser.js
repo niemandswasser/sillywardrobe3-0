@@ -14,17 +14,26 @@
 import {
     getSettings,
     getActiveStyle,
-    getMatchingLorebooks,
+    getActivePrefix,
+    getActiveSuffix,
+    getAllEnabledLorebookReferences,
     normalizeGroupName,
     iigLog,
 } from './settings.js';
 import {
     checkFileExists,
-    escapeRegex,
+    decodeHtmlEntities,
     normalizeStoredImagePath,
     sanitizeForHtml,
     sanitizeForSingleQuotedAttribute,
 } from './utils.js';
+import { buildExtraPromptBlocks } from './extras.js';
+import {
+    findFirstMatchKeyword,
+    normalizeMatchText,
+    splitMatchKeywords,
+    textContainsMatchKeyword,
+} from './matching.js';
 
 // ----- Shared message-text helpers -----
 
@@ -38,8 +47,14 @@ export function getMessageRenderText(message, settings = getSettings()) {
 
 export async function parseMessageImageTags(message, options = {}) {
     const settings = getSettings();
-    const tags = [];
+    if (settings.externalBlocks && message?.extra?.display_text) {
+        const displayTags = await parseImageTags(message.extra.display_text, options);
+        if (displayTags.length > 0) {
+            return displayTags.map(tag => ({ ...tag, sourceKey: 'display_text' }));
+        }
+    }
 
+    const tags = [];
     const mainTags = await parseImageTags(message?.mes || '', options);
     tags.push(...mainTags.map(tag => ({ ...tag, sourceKey: 'mes' })));
 
@@ -53,6 +68,26 @@ export async function parseMessageImageTags(message, options = {}) {
 
 export function replaceTagInMessageSource(message, tag, replacement) {
     if (!message || !tag) return;
+
+    if (tag.sourceKey === 'display_text') {
+        if (!message.extra) message.extra = {};
+        message.extra.display_text = (message.extra.display_text || '').replace(tag.fullMatch, replacement);
+
+        // Keep storage mirrors in sync when they contain the same raw tag.
+        if (message.mes) message.mes = message.mes.replace(tag.fullMatch, replacement);
+        if (message.extra.extblocks) message.extra.extblocks = message.extra.extblocks.replace(tag.fullMatch, replacement);
+
+        const swipeId = message.swipe_id;
+        if (swipeId !== undefined) {
+            if (Array.isArray(message.swipes) && typeof message.swipes[swipeId] === 'string') {
+                message.swipes[swipeId] = message.swipes[swipeId].replace(tag.fullMatch, replacement);
+            }
+            const swipeExtra = message.swipe_info?.[swipeId]?.extra;
+            if (swipeExtra?.display_text) swipeExtra.display_text = swipeExtra.display_text.replace(tag.fullMatch, replacement);
+            if (swipeExtra?.extblocks) swipeExtra.extblocks = swipeExtra.extblocks.replace(tag.fullMatch, replacement);
+        }
+        return;
+    }
 
     if (tag.sourceKey === 'extblocks') {
         if (!message.extra) message.extra = {};
@@ -106,7 +141,6 @@ export function extractGeneratedImageUrlsFromText(text) {
             src.includes('[IMG:') ||
             src.includes('[VID:') ||
             src.endsWith('/error.svg') ||
-            src.endsWith('/stopped.svg') ||
             seen.has(src)
         ) {
             continue;
@@ -121,35 +155,15 @@ export function extractGeneratedImageUrlsFromText(text) {
 // ----- Trigger-name matching (используется в references.js) -----
 
 export function normalizeReferenceTriggerText(text) {
-    return String(text || '')
-        .normalize('NFKC')
-        .toLowerCase()
-        .replace(/\s+/g, ' ')
-        .trim();
+    return normalizeMatchText(text);
 }
 
 export function promptContainsReferenceName(prompt, name) {
-    const normalizedPrompt = normalizeReferenceTriggerText(prompt);
-    const normalizedName = normalizeReferenceTriggerText(name);
-
-    if (!normalizedPrompt || !normalizedName) {
-        return false;
-    }
-
-    const pattern = escapeRegex(normalizedName).replace(/\s+/g, '\\s+');
-    try {
-        const regex = new RegExp(`(^|[^\\p{L}\\p{N}_])${pattern}(?=$|[^\\p{L}\\p{N}_])`, 'iu');
-        return regex.test(normalizedPrompt);
-    } catch (_error) {
-        return normalizedPrompt.includes(normalizedName);
-    }
+    return textContainsMatchKeyword(prompt, name);
 }
 
 export function parseReferenceAliases(name) {
-    return String(name || '')
-        .split(',')
-        .map((alias) => normalizeReferenceTriggerText(alias))
-        .filter(Boolean);
+    return splitMatchKeywords(name);
 }
 
 /**
@@ -161,9 +175,12 @@ export function parseReferenceAliases(name) {
  * не парсится — fallback на literal-match.
  */
 export function findPrimaryKeyMatch(prompt, name, useRegex) {
-    if (!useRegex) {
-        const aliases = parseReferenceAliases(name);
-        const hit = aliases.find((alias) => promptContainsReferenceName(prompt, alias));
+    const aliases = parseReferenceAliases(name);
+
+    // A comma-separated trigger is always an OR alias list. This remains
+    // literal even if Regex was accidentally left enabled for the entry.
+    if (!useRegex || aliases.length > 1) {
+        const hit = findFirstMatchKeyword(prompt, aliases);
         return hit ? { kind: 'primary', detail: hit } : null;
     }
 
@@ -243,15 +260,6 @@ export function injectStyleBlock(prompt, styleValue) {
     return `${styleBlock}\n\n${normalizedPrompt}`.trim();
 }
 
-export function injectPlainStyle(prompt, styleValue) {
-    const normalizedStyle = String(styleValue || '').trim();
-    STYLE_BLOCK_RE.lastIndex = 0;
-    const normalizedPrompt = String(prompt || '').replace(STYLE_BLOCK_RE, '').trim();
-    if (!normalizedStyle) return normalizedPrompt;
-    if (!normalizedPrompt) return normalizedStyle;
-    return `${normalizedStyle}\n\n${normalizedPrompt}`;
-}
-
 export function resolveEffectiveStyle(tagStyle = '', settings = getSettings()) {
     const activeStyle = getActiveStyle(settings);
     const extensionStyleValue = String(activeStyle?.value || '').trim();
@@ -261,19 +269,14 @@ export function resolveEffectiveStyle(tagStyle = '', settings = getSettings()) {
 
 export function buildAdditionalReferencesPromptBlock(matchedRefs = []) {
     const items = matchedRefs
-        .map((ref) => {
-            const name = String(ref?.name || '').trim();
-            const desc = String(ref?.description || '').trim();
-            if (name && desc) return `${name}: ${desc}`;
-            return desc || name;
-        })
+        .map((ref) => String(ref?.description || ref?.name || '').trim())
         .filter(Boolean);
 
     if (items.length === 0) {
         return '';
     }
 
-    return `Reference descriptions (use these to keep characters and items visually consistent):\n${items.map((item) => `- ${item}`).join('\n')}`;
+    return `Additional References:\n${items.map((item) => `- ${item}`).join('\n')}`;
 }
 
 export function buildFinalGenerationPrompt(
@@ -281,17 +284,27 @@ export function buildFinalGenerationPrompt(
     style,
     matchedAdditionalRefs = [],
     settings = getSettings(),
-    { wrapStyle = true } = {},
+    { includeReferencePromptBlocks = true } = {},
 ) {
-    const effectiveStyle = resolveEffectiveStyle(style, settings);
-    let fullPrompt = wrapStyle
-        ? injectStyleBlock(prompt, effectiveStyle)
-        : injectPlainStyle(prompt, effectiveStyle);
+    const prefixValue = String(getActivePrefix(settings)?.value || '').trim();
+    const suffixValue = String(getActiveSuffix(settings)?.value || '').trim();
+    let desc = String(prompt || '').trim();
+    if (prefixValue) desc = `${prefixValue} ${desc}`;
+    if (suffixValue) desc = `${desc} ${suffixValue}`;
 
-    if (settings.sendRefDescriptions !== false) {
+    const effectiveStyle = resolveEffectiveStyle(style, settings);
+    let fullPrompt = injectStyleBlock(desc, effectiveStyle);
+
+    if (includeReferencePromptBlocks) {
         const additionalReferencesBlock = buildAdditionalReferencesPromptBlock(matchedAdditionalRefs);
         if (additionalReferencesBlock) {
             fullPrompt = `${fullPrompt}\n\n${additionalReferencesBlock}`.trim();
+        }
+
+    // NPC appearance + wardrobe instructions (порт из MG).
+        const extraBlocks = buildExtraPromptBlocks(prompt);
+        if (extraBlocks.length > 0) {
+            fullPrompt = `${fullPrompt}\n\n${extraBlocks.join('\n\n')}`.trim();
         }
     }
 
@@ -299,10 +312,9 @@ export function buildFinalGenerationPrompt(
 }
 
 export function getMatchedAdditionalReferences(prompt) {
-    const settings = getSettings();
-    const isPowerMode = settings.additionalReferencesMode === 'power';
-    const refs = getMatchingLorebooks(settings)
-        .flatMap((book) => book.refs.map((ref) => ({ ...ref, _lorebookName: book.name })))
+    // Итерируем все enabled лорбуки — refs всех enabled лорбуков
+    // объединяются в один пул и матчатся по prompt.
+    const refs = getAllEnabledLorebookReferences()
         .map((ref) => ({
             id: String(ref?.id || '').trim(),
             name: String(ref?.name || '').trim(),
@@ -311,12 +323,12 @@ export function getMatchedAdditionalReferences(prompt) {
             matchMode: ref?.matchMode === 'always' ? 'always' : 'match',
             enabled: ref?.enabled !== false,
             group: normalizeGroupName(ref?.group),
-            priority: isPowerMode && Number.isFinite(ref?.priority) ? ref.priority : 0,
-            useRegex: isPowerMode && ref?.useRegex === true,
-            secondaryKeys: isPowerMode ? String(ref?.secondaryKeys || '') : '',
+            priority: Number.isFinite(ref?.priority) ? ref.priority : 0,
+            useRegex: ref?.useRegex === true,
+            secondaryKeys: String(ref?.secondaryKeys || ''),
             _lorebookName: String(ref?._lorebookName || ''),
         }))
-        .filter((ref) => ref.enabled && ref.name && (ref.imagePath || ref.description));
+        .filter((ref) => ref.enabled && ref.name && ref.imagePath);
 
     const matched = [];
     const seenKeys = new Set();
@@ -337,7 +349,7 @@ export function getMatchedAdditionalReferences(prompt) {
             continue;
         }
 
-        const dedupeKey = JSON.stringify([ref.name, ref.imagePath, ref.description]);
+        const dedupeKey = `${ref.name}::${ref.imagePath}`;
         if (seenKeys.has(dedupeKey)) continue;
         seenKeys.add(dedupeKey);
         matched.push({ ...ref, _matchReason: matchReason });
@@ -373,15 +385,6 @@ const INSTRUCTION_FIELD_NAMES = Object.freeze([
     'quality',
 ]);
 
-export function normalizeInstructionPayload(text) {
-    return String(text || '')
-        .replace(/&quot;/g, '"')
-        .replace(/&apos;/g, "'")
-        .replace(/&#39;/g, "'")
-        .replace(/&#34;/g, '"')
-        .replace(/&amp;/g, '&');
-}
-
 function decodeRelaxedInstructionValue(value) {
     return String(value || '')
         .trim()
@@ -394,7 +397,7 @@ function decodeRelaxedInstructionValue(value) {
 }
 
 function parseRelaxedInstructionObject(payload) {
-    const normalized = normalizeInstructionPayload(payload);
+    const normalized = decodeHtmlEntities(payload);
     const keyRegex = /(["'])(style|prompt|aspect_ratio|aspectRatio|preset|image_size|imageSize|quality)\1\s*:\s*(["'])/g;
     const matches = Array.from(normalized.matchAll(keyRegex));
     if (matches.length === 0) {
@@ -429,7 +432,7 @@ function parseRelaxedInstructionObject(payload) {
 }
 
 export function parseInstructionObject(payload) {
-    const normalized = normalizeInstructionPayload(payload);
+    const normalized = decodeHtmlEntities(payload);
 
     try {
         return JSON.parse(normalized);
@@ -498,19 +501,14 @@ export function createGeneratedMediaElement(result, tag) {
 }
 
 export function buildPersistedVideoTag(templateHtml, persistedSrc, posterSrc = '') {
-    const safeSrc = sanitizeForHtml(persistedSrc);
     let html = String(templateHtml || '').trim()
         .replace(/^<(?:img|video)\b/i, '<video controls autoplay loop muted playsinline')
         .replace(/<\/video>\s*$/i, '')
         .replace(/\/?>\s*$/i, '')
-        .replace(/src\s*=\s*(['"])[^'"]*\1/i, () => `src="${safeSrc}"`);
-    if (!/\s+src\s*=/i.test(html)) {
-        html = html.replace(/^<video\b/i, `<video src="${safeSrc}"`);
-    }
+        .replace(/src\s*=\s*(['"])[^'"]*\1/i, `src="${persistedSrc}"`);
     html = html.replace(/\s+poster\s*=\s*(['"])[\s\S]*?\1/i, '');
     if (posterSrc) {
-        const safePosterSrc = sanitizeForHtml(posterSrc);
-        html = html.replace(/^<video\b/i, `<video poster="${safePosterSrc}"`);
+        html = html.replace(/^<video\b/i, `<video poster="${sanitizeForHtml(posterSrc)}"`);
     }
     return `${html}></video>`;
 }
@@ -522,12 +520,7 @@ export function buildPendingLegacyTag(tag) {
 
 export function buildPersistedImageTag(tag, persistedSrc) {
     const templateHtml = tag?.isNewFormat ? tag.fullMatch : buildPendingLegacyTag(tag);
-    const safeSrc = sanitizeForHtml(persistedSrc);
-    let html = String(templateHtml || '');
-    if (/\s+src\s*=/i.test(html)) {
-        return html.replace(/src\s*=\s*(['"])[^'"]*\1/i, () => `src="${safeSrc}"`);
-    }
-    return html.replace(/(<(?:img|video)\b[^>]*?)(\/?>)/i, (_match, openTag, close) => `${openTag} src="${safeSrc}"${close}`);
+    return String(templateHtml || '').replace(/src\s*=\s*(['"])[^'"]*\1/i, `src="${persistedSrc}"`);
 }
 
 export function buildPersistedMediaTag(tag, generated, persistedSrc, posterSrc = '') {
@@ -688,12 +681,11 @@ export async function parseImageTags(text, options = {}) {
         let needsGeneration = false;
         const hasMarker = srcValue.includes('[IMG:GEN]') || srcValue.includes('[IMG:');
         const hasErrorImage = srcValue.includes('error.svg'); // Our error placeholder - NO auto-retry
-        const hasStoppedImage = srcValue.includes('stopped.svg'); // Our stop placeholder - NO auto-retry
         const hasPath = srcValue && srcValue.startsWith('/') && srcValue.length > 5;
 
-        // Skip error/stopped images - user must click to retry manually (prevents conflict on swipe)
-        if ((hasErrorImage || hasStoppedImage) && !forceAll) {
-            iigLog('INFO', `Skipping ${hasStoppedImage ? 'stopped' : 'error'} image (click to retry): ${srcValue.substring(0, 50)}`);
+        // Skip error images - user must click to retry manually (prevents conflict on swipe)
+        if (hasErrorImage && !forceAll) {
+            iigLog('INFO', `Skipping error image (click to retry): ${srcValue.substring(0, 50)}`);
             searchPos = mediaEnd;
             continue;
         }

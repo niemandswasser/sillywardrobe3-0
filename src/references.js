@@ -12,7 +12,6 @@ import {
     getSettings,
     saveSettings,
     getActiveLorebookReferences,
-    getMatchingLorebooks,
     ensureLorebooks,
     createLorebook,
     normalizeImageContextCount,
@@ -31,6 +30,7 @@ import {
     getMessageRenderText,
 } from './parser.js';
 import { t } from './i18n.js';
+import { findFirstMatchKeyword, splitMatchKeywords } from './matching.js';
 
 // ----- Module state -----
 
@@ -40,6 +40,7 @@ const PERSONAS_MODULE_PATHS = Object.freeze([
 ]);
 
 let personasModulePromise = null;
+let personasModuleCache = null;
 let cachedUserAvatars = [];
 const temporaryPrimaryReferenceIds = new Map();
 const MAX_CHARACTER_GENERATIONS = 48;
@@ -71,8 +72,12 @@ function normalizeCharacterGeneration(raw) {
 }
 
 function normalizeCharacterLibraryEntry(raw) {
+    const tags = Array.isArray(raw?.tags) ? raw.tags : String(raw?.tags || '').split(',');
     return {
         displayName: String(raw?.displayName || '').trim(),
+        triggerKeywords: String(raw?.triggerKeywords || '').trim(),
+        custom: raw?.custom === true,
+        tags: [...new Set(tags.map((tag) => String(tag || '').trim()).filter(Boolean))],
         primary: {
             enabled: raw?.primary?.enabled !== false,
             imagePath: normalizeStoredImagePath(raw?.primary?.imagePath),
@@ -175,17 +180,31 @@ export function getCurrentCharacterReferenceKey() {
 }
 
 export async function getCurrentUserReferenceKey(settings = getSettings()) {
-    if (settings.useActiveUserPersonaAvatar) {
-        try {
-            const personasModule = await loadPersonasModule();
-            const activeAvatarId = String(personasModule?.user_avatar || '').trim();
-            if (activeAvatarId) return getUserReferenceKeyForAvatar(activeAvatarId);
-        } catch (_error) {
-            // Fall back to selected avatar below.
-        }
+    try {
+        const personasModule = await loadPersonasModule();
+        const activeAvatarId = String(personasModule?.user_avatar || '').trim();
+        if (activeAvatarId) return getUserReferenceKeyForAvatar(activeAvatarId);
+    } catch (_error) {
+        // No active persona is available.
     }
-    const avatarFile = String(settings.userAvatarFile || '').trim();
-    return getUserReferenceKeyForAvatar(avatarFile);
+    return 'no-user-avatar';
+}
+
+export function getEffectiveCurrentCharacterReferenceKey(settings = getSettings()) {
+    return getActiveCustomCharacterLibraryProfileKey('char', settings) || getCurrentCharacterReferenceKey();
+}
+
+export async function getEffectiveCurrentUserReferenceKey(settings = getSettings()) {
+    return getActiveCustomCharacterLibraryProfileKey('user', settings) || await getCurrentUserReferenceKey(settings);
+}
+
+export async function getEffectiveCharacterLibraryDisplayName(kind, fallback = '', settings = getSettings()) {
+    const normalizedKind = kind === 'user' ? 'user' : 'char';
+    const key = normalizedKind === 'user'
+        ? await getEffectiveCurrentUserReferenceKey(settings)
+        : getEffectiveCurrentCharacterReferenceKey(settings);
+    const entry = getCharacterLibraryEntry(normalizedKind, key, settings, { create: false });
+    return String(entry?.displayName || fallback || '').trim();
 }
 
 export function getCharacterLibraryEntry(kind, key, settings = getSettings(), { create = true } = {}) {
@@ -205,8 +224,47 @@ export function deleteCharacterLibraryEntry(kind, key, settings = getSettings())
     const library = ensureCharacterReferenceLibrary(settings);
     const bucket = kind === 'user' ? library.users : library.characters;
     delete bucket[String(key || '').trim()];
+    if (settings.activeCustomReferenceProfiles?.[kind === 'user' ? 'user' : 'char'] === String(key || '').trim()) {
+        settings.activeCustomReferenceProfiles[kind === 'user' ? 'user' : 'char'] = '';
+    }
     temporaryPrimaryReferenceIds.delete(getTemporaryPrimaryKey(kind, key));
     saveSettings();
+}
+
+export function createCustomCharacterLibraryProfile(kind, name = '', settings = getSettings()) {
+    const normalizedKind = kind === 'user' ? 'user' : 'char';
+    const key = `custom:${makeCharacterLibraryItemId('profile')}`;
+    const entry = getCharacterLibraryEntry(normalizedKind, key, settings);
+    entry.custom = true;
+    entry.displayName = String(name || '').trim() || (normalizedKind === 'user' ? 'New persona profile' : 'New character profile');
+    entry.triggerKeywords = entry.displayName;
+    saveSettings();
+    return { kind: normalizedKind, key, entry };
+}
+
+function ensureActiveCustomProfiles(settings = getSettings()) {
+    if (!settings.activeCustomReferenceProfiles || typeof settings.activeCustomReferenceProfiles !== 'object') {
+        settings.activeCustomReferenceProfiles = { char: '', user: '' };
+    }
+    settings.activeCustomReferenceProfiles.char = String(settings.activeCustomReferenceProfiles.char || '').trim();
+    settings.activeCustomReferenceProfiles.user = String(settings.activeCustomReferenceProfiles.user || '').trim();
+    return settings.activeCustomReferenceProfiles;
+}
+
+export function getActiveCustomCharacterLibraryProfileKey(kind, settings = getSettings()) {
+    const normalizedKind = kind === 'user' ? 'user' : 'char';
+    const key = ensureActiveCustomProfiles(settings)[normalizedKind];
+    const entry = key ? getCharacterLibraryEntry(normalizedKind, key, settings, { create: false }) : null;
+    return entry?.custom ? key : '';
+}
+
+export function setActiveCustomCharacterLibraryProfile(kind, key = '', settings = getSettings()) {
+    const normalizedKind = kind === 'user' ? 'user' : 'char';
+    const normalizedKey = String(key || '').trim();
+    const entry = normalizedKey ? getCharacterLibraryEntry(normalizedKind, normalizedKey, settings, { create: false }) : null;
+    ensureActiveCustomProfiles(settings)[normalizedKind] = entry?.custom ? normalizedKey : '';
+    saveSettings();
+    return ensureActiveCustomProfiles(settings)[normalizedKind];
 }
 
 export function addCharacterLibraryAppearanceItem(kind, key, type, settings = getSettings()) {
@@ -332,44 +390,92 @@ export function getCharacterLibraryDescription(kind, key, settings = getSettings
     ].map(normalizeReferenceDescription).filter(Boolean).join(' ');
 }
 
-export async function buildCharacterDescriptionPromptBlock({
-    includeChar = false,
-    includeUser = false,
-    references = [],
-    mode = 'as-is',
-} = {}, settings = getSettings()) {
-    if (settings.sendRefDescriptions === false || mode === 'none') return '';
+export function characterLibraryEntryMatchesPrompt(kind, key, prompt, settings = getSettings()) {
+    const entry = getCharacterLibraryEntry(kind, key, settings, { create: false });
+    if (!entry) return false;
+    const keywords = splitMatchKeywords(entry.triggerKeywords);
+    return keywords.length > 0 && Boolean(findFirstMatchKeyword(prompt, keywords));
+}
 
-    const sentSources = new Set((Array.isArray(references) ? references : [])
-        .map(getReferenceSource)
-        .filter(Boolean));
-    const includeSentSources = mode === 'character-prompt';
-    let charDescription = '';
-    let userDescription = '';
-
-    if (includeChar && (includeSentSources || !sentSources.has('char'))) {
-        const key = getCurrentCharacterReferenceKey();
-        charDescription = getCharacterLibraryDescription('char', key, settings);
+export function getCurrentUserReferenceKeySync(settings = getSettings()) {
+    try {
+        const fromModule = String(personasModuleCache?.user_avatar || '').trim();
+        if (fromModule) return getUserReferenceKeyForAvatar(fromModule);
+        const context = SillyTavern.getContext();
+        const fromChat = String(context?.chatMetadata?.persona || '').trim();
+        if (fromChat) return getUserReferenceKeyForAvatar(fromChat);
+        const matches = Object.entries(context?.powerUserSettings?.personas || {})
+            .filter(([, name]) => String(name || '') === String(context?.name1 || ''))
+            .map(([avatar]) => String(avatar || '').trim())
+            .filter(Boolean);
+        if (matches.length === 1) return getUserReferenceKeyForAvatar(matches[0]);
+    } catch (_error) {
+        // No synchronous persona context is available.
     }
+    return 'no-user-avatar';
+}
 
-    if (includeUser && (includeSentSources || !sentSources.has('user'))) {
-        const key = await getCurrentUserReferenceKey(settings);
-        userDescription = getCharacterLibraryDescription('user', key, settings);
-    }
+export function activeCharacterLibraryEntryMatchesPrompt(kind, prompt, settings = getSettings()) {
+    const key = kind === 'user'
+        ? (getActiveCustomCharacterLibraryProfileKey('user', settings) || getCurrentUserReferenceKeySync(settings))
+        : getEffectiveCurrentCharacterReferenceKey(settings);
+    return characterLibraryEntryMatchesPrompt(kind, key, prompt, settings);
+}
 
-    if (mode === 'character-prompt') {
-        const lines = [userDescription, charDescription]
-            .filter(Boolean)
-            .map((description) => `\\| ${description}`);
-        return lines.join('\n');
-    }
+export async function activeCharacterLibraryEntryMatchesPromptAsync(kind, prompt, settings = getSettings()) {
+    const key = kind === 'user'
+        ? await getEffectiveCurrentUserReferenceKey(settings)
+        : getEffectiveCurrentCharacterReferenceKey(settings);
+    return characterLibraryEntryMatchesPrompt(kind, key, prompt, settings);
+}
 
+export async function shouldSendCharacterLibraryReference(kind, prompt, settings = getSettings()) {
+    if (settings.optionalAvatarSending !== true) return true;
+    const key = kind === 'user'
+        ? await getEffectiveCurrentUserReferenceKey(settings)
+        : getEffectiveCurrentCharacterReferenceKey(settings);
+    return characterLibraryEntryMatchesPrompt(kind, key, prompt, settings);
+}
+
+export async function buildActiveCharacterLibraryPromptBlock(settings = getSettings(), prompt = '') {
+    if (settings.sendRefDescriptions === false) return '';
+    const useNaisteraFlags = settings.apiType === 'naistera';
+    const charKey = getEffectiveCurrentCharacterReferenceKey(settings);
+    const userKey = await getEffectiveCurrentUserReferenceKey(settings);
+    const targets = [
+        {
+            kind: 'char',
+            enabled: useNaisteraFlags ? settings.naisteraSendCharAvatar : settings.sendCharAvatar,
+            key: charKey,
+            label: getCharacterLibraryEntry('char', charKey, settings, { create: false })?.custom
+                ? getCharacterLibraryEntry('char', charKey, settings, { create: false })?.displayName || '{{char}}'
+                : '{{char}}',
+        },
+        {
+            kind: 'user',
+            enabled: useNaisteraFlags ? settings.naisteraSendUserAvatar : settings.sendUserAvatar,
+            key: userKey,
+            label: getCharacterLibraryEntry('user', userKey, settings, { create: false })?.custom
+                ? getCharacterLibraryEntry('user', userKey, settings, { create: false })?.displayName || '{{user}}'
+                : '{{user}}',
+        },
+    ];
     const lines = [];
-    if (charDescription) lines.push(`- {{char}}: ${charDescription}`);
-    if (userDescription) lines.push(`- {{user}}: ${userDescription}`);
-    return lines.length > 0
-        ? `Character descriptions:\n${lines.join('\n')}`
-        : '';
+    for (const target of targets) {
+        if (!target.enabled) continue;
+        if (!await shouldSendCharacterLibraryReference(target.kind, prompt, settings)) continue;
+        const entry = getCharacterLibraryEntry(target.kind, target.key, settings, { create: false });
+        if (!entry) continue;
+        const descriptions = [
+            entry.primary?.enabled !== false ? entry.primary?.description : '',
+            ...(entry.appearanceItems || [])
+                .filter(item => item.enabled !== false)
+                .map(item => item.description),
+        ].map(normalizeReferenceDescription).filter(Boolean);
+        const unique = [...new Set(descriptions)];
+        if (unique.length) lines.push(`- ${target.label}: ${unique.join(' ')}`);
+    }
+    return lines.length ? `Character appearance references:\n${lines.join('\n')}` : '';
 }
 
 // ----- Загрузка модуля personas (для активного user persona avatar) -----
@@ -380,7 +486,9 @@ export async function loadPersonasModule() {
             let lastError = null;
             for (const modulePath of PERSONAS_MODULE_PATHS) {
                 try {
-                    return await import(modulePath);
+                    const module = await import(modulePath);
+                    personasModuleCache = module;
+                    return module;
                 } catch (error) {
                     lastError = error;
                 }
@@ -571,47 +679,29 @@ export function buildUserAvatarDropdownControl(prefix, selectedAvatar) {
 // ----- User avatar URL resolver (persona + selected file) -----
 
 export async function getSelectedUserAvatarUrl() {
-    const settings = getSettings();
-
-    if (settings.useActiveUserPersonaAvatar) {
-        try {
-            const personasModule = await loadPersonasModule();
-            const activeAvatarId = String(personasModule?.user_avatar || '').trim();
-            if (!activeAvatarId) {
-                console.log('[IIG] No active user persona avatar selected');
-                if (!settings.userAvatarFile) {
-                    return null;
-                }
-            } else {
-                if (typeof personasModule?.getUserAvatar === 'function') {
-                    const resolved = String(personasModule.getUserAvatar(activeAvatarId) || '').trim();
-                    if (resolved) {
-                        const normalized = resolved.replace(/^\/+/, '');
-                        console.log('[IIG] Using active user persona avatar:', normalized);
-                        return `/${normalized}`;
-                    }
-                }
-
-                const fallback = `/User Avatars/${encodeURIComponent(activeAvatarId)}`;
-                console.log('[IIG] Falling back to active user persona avatar path:', fallback);
-                return fallback;
-            }
-        } catch (error) {
-            console.error('[IIG] Failed to resolve active user persona avatar:', error);
-            if (!settings.userAvatarFile) {
-                return null;
+    try {
+        const personasModule = await loadPersonasModule();
+        const activeAvatarId = String(personasModule?.user_avatar || '').trim();
+        if (!activeAvatarId) {
+            console.log('[IIG] No active user persona avatar selected');
+            return null;
+        }
+        if (typeof personasModule?.getUserAvatar === 'function') {
+            const resolved = String(personasModule.getUserAvatar(activeAvatarId) || '').trim();
+            if (resolved) {
+                const normalized = resolved.replace(/^\/+/, '');
+                console.log('[IIG] Using active user persona avatar:', normalized);
+                return `/${normalized}`;
             }
         }
-    }
 
-    if (!settings.userAvatarFile) {
-        console.log('[IIG] No user avatar selected in settings');
+        const fallback = `/User Avatars/${encodeURIComponent(activeAvatarId)}`;
+        console.log('[IIG] Falling back to active user persona avatar path:', fallback);
+        return fallback;
+    } catch (error) {
+        console.error('[IIG] Failed to resolve active user persona avatar:', error);
         return null;
     }
-
-    const avatarUrl = `/User Avatars/${encodeURIComponent(settings.userAvatarFile)}`;
-    console.log('[IIG] Using selected user avatar:', avatarUrl);
-    return avatarUrl;
 }
 
 async function getCurrentCharacterAvatarUrl() {
@@ -629,12 +719,13 @@ async function getCurrentCharacterAvatarUrl() {
     }
 }
 
-export async function collectCharacterLibraryReferences(kind, format, settings = getSettings()) {
+export async function collectCharacterLibraryReferences(kind, format, settings = getSettings(), prompt = null) {
+    if (prompt !== null && !await shouldSendCharacterLibraryReference(kind, prompt, settings)) return [];
     const isUser = kind === 'user';
-    const key = isUser ? await getCurrentUserReferenceKey(settings) : getCurrentCharacterReferenceKey();
+    const key = isUser ? await getEffectiveCurrentUserReferenceKey(settings) : getEffectiveCurrentCharacterReferenceKey(settings);
     const entry = getCharacterLibraryEntry(kind, key, settings, { create: false });
     const convert = format === 'dataUrl' ? imageUrlToDataUrl : imageUrlToBase64;
-    const baseAvatarUrl = isUser ? await getSelectedUserAvatarUrl() : await getCurrentCharacterAvatarUrl();
+    const baseAvatarUrl = entry?.custom ? '' : (isUser ? await getSelectedUserAvatarUrl() : await getCurrentCharacterAvatarUrl());
     const source = isUser ? 'user' : 'char';
     const results = [];
     const sharedDescription = getCharacterLibraryDescription(kind, key, settings);
@@ -682,6 +773,29 @@ export async function collectCharacterLibraryReferences(kind, format, settings =
     }
 
     return results;
+}
+
+// Compatibility helpers used by Novarakk providers, wardrobe and extras.
+// The new library is the single source of avatar references; its first
+// enabled reference acts as the former standalone avatar value.
+export async function getCharacterAvatarBase64() {
+    const refs = await collectCharacterLibraryReferences('char', 'base64');
+    return getReferenceImage(refs[0]) || null;
+}
+
+export async function getCharacterAvatarDataUrl() {
+    const refs = await collectCharacterLibraryReferences('char', 'dataUrl');
+    return getReferenceImage(refs[0]) || null;
+}
+
+export async function getUserAvatarBase64() {
+    const refs = await collectCharacterLibraryReferences('user', 'base64');
+    return getReferenceImage(refs[0]) || null;
+}
+
+export async function getUserAvatarDataUrl() {
+    const refs = await collectCharacterLibraryReferences('user', 'dataUrl');
+    return getReferenceImage(refs[0]) || null;
 }
 
 // ----- Previous-message context images -----
@@ -808,6 +922,9 @@ export function buildAdditionalReferenceRowsHtml(settings = getSettings(), viewS
                         <button type="button" class="menu_button iig-additional-ref-upload-url" title="${t`Upload image by URL`}">
                             <i class="fa-solid fa-link"></i>
                         </button>
+                        <button type="button" class="menu_button iig-additional-ref-vision ${selectedPreviewSrc ? '' : 'iig-hidden'}" title="${t`Describe appearance via Vision AI`}">
+                            <i class="fa-solid fa-robot"></i>
+                        </button>
                     </div>
                 </div>
                 <div class="iig-additional-ref-editor-fields">
@@ -913,17 +1030,14 @@ export function renderAdditionalReferencesStatus(providerMaxRefs = 0) {
     const status = document.getElementById('iig_additional_refs_status');
     if (!status) return;
 
-    const refs = getActiveLorebookReferences().filter((ref) =>
-        String(ref?.name || '').trim()
-        && (String(ref?.imagePath || '').trim() || String(ref?.description || '').trim()));
+    const refs = getActiveLorebookReferences().filter((ref) => String(ref?.name || '').trim() && String(ref?.imagePath || '').trim());
     const enabledRefs = refs.filter((ref) => ref.enabled !== false);
-    const enabledImageCount = enabledRefs.filter((ref) => String(ref.imagePath || '').trim()).length;
     const alwaysCount = enabledRefs.filter((ref) => ref.matchMode === 'always').length;
     const parts = [];
     if (refs.length > 0) {
         parts.push(t`Active additional references: ${enabledRefs.length}/${refs.length}. Always sent: ${alwaysCount}.`);
     }
-    if (providerMaxRefs > 0 && enabledImageCount > providerMaxRefs) {
+    if (providerMaxRefs > 0 && enabledRefs.length > providerMaxRefs) {
         parts.push(t`Provider accepts up to ${providerMaxRefs} refs per request — extras will be dropped by priority.`);
     }
     status.textContent = parts.join(' ');
@@ -1016,7 +1130,7 @@ function formatLorebookRefsSections(refs) {
  * список групп).
  */
 export function renderIigBookMacro(settings = getSettings()) {
-    const lorebooks = getMatchingLorebooks(settings);
+    const lorebooks = ensureLorebooks(settings).filter((lb) => lb.enabled !== false);
     if (lorebooks.length === 0) return '';
 
     const blocks = [];

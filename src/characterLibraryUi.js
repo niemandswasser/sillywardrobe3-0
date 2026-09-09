@@ -1,52 +1,56 @@
 import { getSettings, saveSettings } from './settings.js';
 import {
     addCharacterLibraryAppearanceItem,
+    createCustomCharacterLibraryProfile,
     deleteCharacterLibraryEntry,
     downloadReferenceImageFromUrl,
     fetchUserAvatars,
     getCachedUserAvatars,
     getCharacterLibraryEntry,
     getCharacterReferenceKeyForCharacter,
+    getActiveCustomCharacterLibraryProfileKey,
     getCurrentCharacterReferenceKey,
     getCurrentUserReferenceKey,
     getTemporaryCharacterPrimary,
     getUserReferenceKeyForAvatar,
     removeCharacterLibraryAppearanceItem,
+    setActiveCustomCharacterLibraryProfile,
     setTemporaryCharacterPrimary,
-    syncCharacterGenerationHistory,
 } from './references.js';
 import {
     normalizeStoredImagePath,
-    listCharacterGenerationPaths,
+    imageUrlToBase64,
     readFileAsDataUrl,
     sanitizeForHtml,
     saveImageToFile,
 } from './utils.js';
-import {
-    extractGeneratedImageUrlsFromText,
-    getMessageRenderText,
-} from './parser.js';
+import { callVisionApi, DEFAULT_REFERENCE_APPEARANCE_VISION_PROMPT } from './vision.js';
 import { t } from './i18n.js';
 import { Popup } from '../../../../popup.js';
 
 let selectedKind = 'char';
 let selectedKeys = { char: '', user: '' };
 let searchQuery = '';
+let sourceFilter = 'all';
+let tagFilter = '';
+let pickerOpen = false;
 const boundSections = new WeakSet();
 let contextEventsBound = false;
 let refreshTimer = null;
 let searchRenderTimer = null;
 let lastContextSignature = '';
 let libraryRendered = false;
-let libraryImageObserver = null;
+let legacyMigrationPromise = null;
 const pendingContextSync = { character: false, user: false };
 
 const MAX_RENDERED_ENTITIES = 80;
-const LIBRARY_IMAGE_ROOT_MARGIN = '320px 0px';
 
 function emptyLibraryEntry() {
     return {
         displayName: '',
+        triggerKeywords: '',
+        custom: false,
+        tags: [],
         primary: { enabled: true, imagePath: '', description: '' },
         appearanceItems: [],
         generations: [],
@@ -59,6 +63,63 @@ function getContext() {
     } catch (_error) {
         return {};
     }
+}
+
+async function migrateLegacyAvatarLibrary(settings = getSettings()) {
+    if (legacyMigrationPromise) return legacyMigrationPromise;
+    legacyMigrationPromise = (async () => {
+        const legacyItems = Array.isArray(settings.avatarItems) ? settings.avatarItems : [];
+        const migrated = new Set(Array.isArray(settings.legacyAvatarLibraryMigratedIds)
+            ? settings.legacyAvatarLibraryMigratedIds.map(String)
+            : []);
+        const pending = legacyItems.filter(item => item?.id && item?.imageData && !migrated.has(String(item.id)));
+        if (!pending.length) return 0;
+
+        const charKey = getCurrentCharacterReferenceKey();
+        const userKey = await getCurrentUserReferenceKey(settings);
+        let done = 0;
+        const migratedKinds = new Set();
+        for (const item of pending) {
+            const kind = item.target === 'user' ? 'user' : 'char';
+            const key = kind === 'user' ? userKey : charKey;
+            if (!key || key === 'no-character' || key === 'no-user-avatar') continue;
+            try {
+                const imageData = String(item.imageData || '');
+                const dataUrl = imageData.startsWith('data:') ? imageData : `data:image/png;base64,${imageData}`;
+                const imagePath = normalizeStoredImagePath(await saveImageToFile(dataUrl, {
+                    mode: 'legacy-avatar-library-migration',
+                    entityKind: kind,
+                    entityKey: key,
+                    legacyAvatarId: String(item.id),
+                }));
+                const entry = getCharacterLibraryEntry(kind, key, settings);
+                const activeId = kind === 'user' ? settings.activeAvatarUser : settings.activeAvatarChar;
+                if (String(activeId || '') === String(item.id) && !entry.primary.imagePath) {
+                    entry.primary.imagePath = imagePath;
+                    entry.primary.description = String(item.appearance || '').trim();
+                } else {
+                    const appearance = addCharacterLibraryAppearanceItem(kind, key, 'image', settings);
+                    appearance.imagePath = imagePath;
+                    appearance.description = String(item.appearance || item.name || '').trim();
+                }
+                migrated.add(String(item.id));
+                migratedKinds.add(kind);
+                done++;
+            } catch (error) {
+                console.warn('[IIG] Failed to migrate legacy avatar:', item?.name || item?.id, error);
+            }
+        }
+        settings.legacyAvatarLibraryMigratedIds = [...migrated];
+        if (done) {
+            if (migratedKinds.has('char')) settings.activeAvatarChar = null;
+            if (migratedKinds.has('user')) settings.activeAvatarUser = null;
+            saveSettings();
+            toastr.success(t`Old avatars moved to the character library: ${done}`, t`Image Generation`);
+        }
+        return done;
+    })();
+    try { return await legacyMigrationPromise; }
+    finally { legacyMigrationPromise = null; }
 }
 
 function getPersonaTitle(avatarFile) {
@@ -76,6 +137,7 @@ function getCharacterEntities(settings = getSettings()) {
     const context = getContext();
     const characters = Array.isArray(context?.characters) ? context.characters : [];
     const entities = new Map();
+    const activeCustomKey = getActiveCustomCharacterLibraryProfileKey('char', settings);
     characters.forEach((character, index) => {
         const key = getCharacterReferenceKeyForCharacter(character, index);
         const libraryEntry = getCharacterLibraryEntry('char', key, settings, { create: false });
@@ -86,8 +148,10 @@ function getCharacterEntities(settings = getSettings()) {
             fallbackTitle: String(character?.name || character?.avatar || t`Character`),
             avatarUrl: getThumbnailUrl('avatar', character?.avatar),
             generationFolder: String(character?.name || '').trim(),
-            active: key === getCurrentCharacterReferenceKey(),
+            active: !activeCustomKey && key === getCurrentCharacterReferenceKey(),
             configured: Boolean(libraryEntry),
+            custom: false,
+            tags: libraryEntry?.tags || [],
         });
     });
 
@@ -96,15 +160,18 @@ function getCharacterEntities(settings = getSettings()) {
         if (entities.has(key)) continue;
         const entry = getCharacterLibraryEntry('char', key, settings, { create: false });
         const fallbackTitle = key.replace(/^(avatar|name|id):/, '') || t`Character`;
+        const custom = entry?.custom === true || key.startsWith('custom:');
         entities.set(key, {
             kind: 'char',
             key,
             title: entry?.displayName || fallbackTitle,
             fallbackTitle,
-            avatarUrl: key.startsWith('avatar:') ? getThumbnailUrl('avatar', key.slice('avatar:'.length)) : '',
+            avatarUrl: custom ? normalizeStoredImagePath(entry?.primary?.imagePath) : (key.startsWith('avatar:') ? getThumbnailUrl('avatar', key.slice('avatar:'.length)) : ''),
             generationFolder: entry?.displayName || fallbackTitle.replace(/\.[^.]+$/, ''),
-            active: false,
+            active: custom && key === activeCustomKey,
             configured: true,
+            custom,
+            tags: entry?.tags || [],
         });
     }
     return [...entities.values()].sort((a, b) => a.title.localeCompare(b.title));
@@ -114,6 +181,7 @@ async function getUserEntities(settings = getSettings()) {
     let avatars = getCachedUserAvatars();
     if (avatars.length === 0) avatars = await fetchUserAvatars();
     const activeKey = await getCurrentUserReferenceKey(settings);
+    const activeCustomKey = getActiveCustomCharacterLibraryProfileKey('user', settings);
     const entities = new Map();
     for (const avatarFile of avatars) {
         const key = getUserReferenceKeyForAvatar(avatarFile);
@@ -126,8 +194,10 @@ async function getUserEntities(settings = getSettings()) {
             fallbackTitle,
             avatarUrl: getThumbnailUrl('persona', avatarFile),
             generationFolder: '',
-            active: key === activeKey,
+            active: !activeCustomKey && key === activeKey,
             configured: Boolean(libraryEntry),
+            custom: false,
+            tags: libraryEntry?.tags || [],
         });
     }
 
@@ -136,16 +206,19 @@ async function getUserEntities(settings = getSettings()) {
         if (entities.has(key)) continue;
         const entry = getCharacterLibraryEntry('user', key, settings, { create: false });
         const avatarFile = key.replace(/^avatar:/, '');
-        const fallbackTitle = getPersonaTitle(avatarFile);
+        const custom = entry?.custom === true || key.startsWith('custom:');
+        const fallbackTitle = custom ? (entry?.displayName || t`Persona`) : getPersonaTitle(avatarFile);
         entities.set(key, {
             kind: 'user',
             key,
             title: entry?.displayName || fallbackTitle,
             fallbackTitle,
-            avatarUrl: getThumbnailUrl('persona', avatarFile),
+            avatarUrl: custom ? normalizeStoredImagePath(entry?.primary?.imagePath) : getThumbnailUrl('persona', avatarFile),
             generationFolder: '',
-            active: key === activeKey,
+            active: custom ? key === activeCustomKey : (!activeCustomKey && key === activeKey),
             configured: true,
+            custom,
+            tags: entry?.tags || [],
         });
     }
     return [...entities.values()].sort((a, b) => a.title.localeCompare(b.title));
@@ -155,48 +228,28 @@ async function getEntities(kind = selectedKind, settings = getSettings()) {
     return kind === 'user' ? await getUserEntities(settings) : getCharacterEntities(settings);
 }
 
-function loadLibraryImage(image) {
-    const src = String(image?.getAttribute('data-iig-library-src') || '').trim();
-    if (!src) return;
-    image.src = src;
-    image.removeAttribute('data-iig-library-src');
-}
-
-function observeLibraryImages() {
-    const images = Array.from(document.querySelectorAll('.iig-character-library img[data-iig-library-src]'));
-    if (typeof IntersectionObserver !== 'function') {
-        images.forEach(loadLibraryImage);
-        return;
-    }
-    if (!libraryImageObserver) {
-        libraryImageObserver = new IntersectionObserver((entries) => {
-            entries.forEach((entry) => {
-                if (!entry.isIntersecting) return;
-                loadLibraryImage(entry.target);
-                libraryImageObserver?.unobserve(entry.target);
-            });
-        }, { rootMargin: LIBRARY_IMAGE_ROOT_MARGIN });
-    }
-    libraryImageObserver.disconnect();
-    images.forEach((image) => libraryImageObserver.observe(image));
-}
-
 function buildAvatarHtml(src, fallbackIcon = 'fa-user') {
     const safeSrc = normalizeStoredImagePath(src);
     if (!safeSrc) {
         return `<span class="iig-library-avatar-placeholder"><i class="fa-solid ${fallbackIcon}"></i></span>`;
     }
-    return `<img data-iig-library-src="${sanitizeForHtml(safeSrc)}" alt="" loading="lazy" decoding="async" fetchpriority="low">`;
+    return `<img src="${sanitizeForHtml(safeSrc)}" alt="" loading="lazy" decoding="async">`;
 }
 
 function buildEntityOptionHtml(entity, selectedKey) {
-    const searchable = `${entity.title} ${entity.fallbackTitle} ${entity.key}`.toLowerCase();
+    const searchable = `${entity.title} ${entity.fallbackTitle} ${entity.key} ${(entity.tags || []).join(' ')}`.toLowerCase();
+    const status = entity.active
+        ? t`Active`
+        : entity.custom
+            ? t`My profile`
+            : entity.configured ? t`Configured` : '';
     return `
-        <button type="button" class="iig-library-entity ${entity.key === selectedKey ? 'selected' : ''}" data-library-kind="${entity.kind}" data-library-key="${sanitizeForHtml(entity.key)}" data-library-search="${sanitizeForHtml(searchable)}">
+        <button type="button" class="iig-library-entity ${entity.key === selectedKey ? 'selected' : ''} ${entity.custom ? 'custom-profile' : ''}" data-library-kind="${entity.kind}" data-library-key="${sanitizeForHtml(entity.key)}" data-library-search="${sanitizeForHtml(searchable)}">
             <span class="iig-library-entity-avatar">${buildAvatarHtml(entity.avatarUrl, entity.kind === 'char' ? 'fa-user-pen' : 'fa-user')}</span>
             <span class="iig-library-entity-copy">
                 <strong>${sanitizeForHtml(entity.title)}</strong>
-                <small>${entity.active ? t`Active` : entity.configured ? t`Configured` : ''}</small>
+                <small>${status}</small>
+                ${(entity.tags || []).length ? `<span class="iig-library-entity-tags">${entity.tags.slice(0, 3).map((tag) => `<em>${sanitizeForHtml(tag)}</em>`).join('')}</span>` : ''}
             </span>
         </button>`;
 }
@@ -223,6 +276,7 @@ function buildAppearanceItemsHtml(entry) {
                 </div>
                 <div class="iig-library-row-actions">
                     ${isImage ? `<button type="button" class="menu_button iig-library-appearance-primary ${temporaryPrimary ? 'selected' : ''}" title="${temporaryPrimary ? t`Use saved main reference` : t`Use as temporary main reference`}"><i class="fa-solid fa-thumbtack"></i></button>
+                    <button type="button" class="menu_button iig-library-reference-vision ${preview ? '' : 'iig-hidden'}" title="${t`Describe appearance via Vision AI`}"><i class="fa-solid fa-robot"></i></button>
                     <label class="menu_button" title="${t`Choose image`}">
                         <i class="fa-solid fa-upload"></i>
                         <input type="file" accept="image/*" class="iig-library-appearance-file" hidden>
@@ -232,24 +286,6 @@ function buildAppearanceItemsHtml(entry) {
                 </div>
             </div>`;
     }).join('');
-}
-
-function buildGenerationsHtml(entry, key) {
-    const generations = Array.isArray(entry.generations) ? entry.generations : [];
-    if (generations.length === 0) {
-        return `<div class="iig-library-empty">${t`No generations for this character.`}</div>`;
-    }
-    return `
-        <div class="iig-library-generation-gallery" data-iig-lightbox-gallery>
-            ${generations.map((generation) => {
-                const prompt = String(generation.prompt || '').trim();
-                const caption = prompt || t`Generated image`;
-                const imagePath = normalizeStoredImagePath(generation.imagePath);
-                return `<button type="button" class="iig-library-generation-item" title="${sanitizeForHtml(caption)}">
-                    <img data-iig-library-src="${sanitizeForHtml(imagePath)}" data-iig-full-src="${sanitizeForHtml(imagePath)}" alt="" data-iig-lightbox data-iig-lightbox-caption="${sanitizeForHtml(caption)}" data-iig-generation-key="${sanitizeForHtml(key)}" data-iig-generation-id="${sanitizeForHtml(generation.id)}" loading="lazy" decoding="async" fetchpriority="low">
-                </button>`;
-            }).join('')}
-        </div>`;
 }
 
 function buildEditorHtml(entity, entry) {
@@ -265,11 +301,26 @@ function buildEditorHtml(entity, entry) {
             <div class="iig-library-editor-head">
                 <span class="iig-library-editor-avatar">${buildAvatarHtml(primaryPreview, entity.kind === 'char' ? 'fa-user-pen' : 'fa-user')}</span>
                 <label class="iig-library-name-field">
-                    <span>${entity.kind === 'char' ? t`Character` : t`Persona`}</span>
+                    <span>${entity.custom ? t`My profile` : (entity.kind === 'char' ? t`Character` : t`Persona`)}</span>
                     <input type="text" class="text_pole iig-library-display-name" value="${sanitizeForHtml(entry.displayName)}" placeholder="${sanitizeForHtml(entity.fallbackTitle)}">
                 </label>
-                <button type="button" class="menu_button redWarningBG iig-library-entry-delete" title="${t`Clear reference settings`}"><i class="fa-solid fa-trash"></i></button>
+                <div class="iig-library-editor-actions">
+                    ${entity.custom ? `<button type="button" class="menu_button iig-library-profile-active ${entity.active ? 'selected' : ''}" title="${entity.active ? t`Return to the active card or persona` : t`Use this profile for generation`}"><i class="fa-solid ${entity.active ? 'fa-toggle-on' : 'fa-toggle-off'}"></i><span>${entity.active ? t`Active` : t`Activate`}</span></button>` : ''}
+                    <button type="button" class="menu_button redWarningBG iig-library-entry-delete" title="${entity.custom ? t`Delete custom profile` : t`Clear reference settings`}"><i class="fa-solid fa-trash"></i></button>
+                </div>
             </div>
+
+            <label class="iig-library-trigger-field">
+                <span>${t`Avatar match keys`}</span>
+                <input type="text" class="text_pole iig-library-trigger-keywords" value="${sanitizeForHtml(entry.triggerKeywords)}" placeholder="Elon, Erica, Luka">
+                <small>${t`Comma-separated aliases. In optional mode, this avatar is sent only when the prompt contains one of them.`}</small>
+            </label>
+
+            <label class="iig-library-trigger-field iig-library-tags-field">
+                <span>${t`Tags`}</span>
+                <input type="text" class="text_pole iig-library-tags" value="${sanitizeForHtml((entry.tags || []).join(', '))}" placeholder="main, fantasy, favorites">
+                <small>${t`Comma-separated tags are used only to organize and filter the library.`}</small>
+            </label>
 
             <section class="iig-library-editor-section">
                 <div class="iig-library-section-head">
@@ -280,6 +331,7 @@ function buildEditorHtml(entity, entry) {
                             <input type="file" accept="image/*" class="iig-library-primary-file" hidden>
                         </label>
                         <button type="button" class="menu_button iig-library-primary-url" title="${t`Load image by URL`}"><i class="fa-solid fa-link"></i></button>
+                        <button type="button" class="menu_button iig-library-primary-vision ${primaryPreview ? '' : 'iig-hidden'}" title="${t`Describe appearance via Vision AI`}"><i class="fa-solid fa-robot"></i><span>${t`Vision`}</span></button>
                         <button type="button" class="menu_button iig-library-primary-reset ${hasReplacement ? '' : 'iig-hidden'}" title="${t`Use avatar`}"><i class="fa-solid fa-rotate-left"></i></button>
                     </div>
                 </div>
@@ -304,37 +356,64 @@ function buildEditorHtml(entity, entry) {
                 <div class="iig-library-appearance-list">${buildAppearanceItemsHtml(entry)}</div>
             </section>
 
-            ${entity.kind === 'char' ? `<section class="iig-library-editor-section">
-                <div class="iig-library-section-head">
-                    <strong>${t`Generations`}</strong>
-                    <div class="iig-library-row-actions">
-                        <span class="iig-library-section-count">${entry.generations.length}</span>
-                        <button type="button" class="menu_button iig-library-generations-refresh" title="${t`Refresh generations`}"><i class="fa-solid fa-rotate"></i></button>
-                    </div>
-                </div>
-                ${buildGenerationsHtml(entry, entity.key)}
-            </section>` : ''}
         </div>`;
 }
 
-export function buildCharacterLibraryBodyHtml() {
+export function buildCharacterLibraryBodyHtml(settings = getSettings()) {
     return `
         <div class="iig-character-library">
+            <div class="iig-library-optional-send-setting">
+                <label class="checkbox_label">
+                    <input type="checkbox" id="iig_library_optional_send" ${settings.optionalAvatarSending === true ? 'checked' : ''}>
+                    <span>${t`Optional avatar sending`}</span>
+                </label>
+                <p class="hint">${t`When enabled, allowed character and persona avatars are not sent by default. Each avatar is sent only when its match key appears in the image prompt.`}</p>
+            </div>
             <div class="iig-library-toolbar">
                 <div class="iig-library-tabs" role="tablist">
                     <button type="button" class="menu_button iig-library-tab selected" data-library-tab="char"><i class="fa-solid fa-address-card"></i><span>${t`Characters`}</span></button>
                     <button type="button" class="menu_button iig-library-tab" data-library-tab="user"><i class="fa-solid fa-user"></i><span>${t`Personas`}</span></button>
                 </div>
-                <label class="iig-library-search-wrap">
-                    <i class="fa-solid fa-magnifying-glass"></i>
-                    <input id="iig_library_search" class="text_pole" type="search" placeholder="${t`Search characters and personas`}">
-                </label>
+                <button type="button" id="iig_library_create_profile" class="menu_button"><i class="fa-solid fa-user-plus"></i><span>${t`Add custom profile`}</span></button>
             </div>
-            <div class="iig-library-layout">
-                <div id="iig_library_entities" class="iig-library-entities"></div>
+            <div class="iig-library-picker">
+                <button type="button" id="iig_library_picker_toggle" class="iig-library-picker-toggle" aria-expanded="false"></button>
+                <div id="iig_library_picker_panel" class="iig-library-picker-panel iig-hidden">
+                    <label class="iig-library-search-wrap">
+                        <i class="fa-solid fa-magnifying-glass"></i>
+                        <input id="iig_library_search" class="text_pole" type="search" placeholder="${t`Search characters and personas`}">
+                    </label>
+                    <div class="iig-library-filters">
+                        <select id="iig_library_source_filter" class="text_pole">
+                            <option value="all">${t`All sources`}</option>
+                            <option value="linked">${t`Cards and personas`}</option>
+                            <option value="custom">${t`My profiles`}</option>
+                        </select>
+                        <select id="iig_library_tag_filter" class="text_pole">
+                            <option value="">${t`All tags`}</option>
+                        </select>
+                    </div>
+                    <div id="iig_library_entities" class="iig-library-entities"></div>
+                </div>
+            </div>
+            <div class="iig-library-layout iig-library-editor-layout">
                 <div id="iig_library_editor_host" class="iig-library-editor-host"></div>
             </div>
         </div>`;
+}
+
+function syncPickerUi(selectedEntity = null) {
+    const toggle = document.getElementById('iig_library_picker_toggle');
+    const panel = document.getElementById('iig_library_picker_panel');
+    if (toggle instanceof HTMLButtonElement) {
+        toggle.setAttribute('aria-expanded', String(pickerOpen));
+        toggle.innerHTML = selectedEntity
+            ? `<span class="iig-library-entity-avatar">${buildAvatarHtml(selectedEntity.avatarUrl, selectedEntity.kind === 'char' ? 'fa-user-pen' : 'fa-user')}</span>
+               <span class="iig-library-picker-copy"><small>${selectedEntity.kind === 'char' ? t`Character` : t`Persona`}</small><strong>${sanitizeForHtml(selectedEntity.title)}</strong></span>
+               <i class="fa-solid fa-chevron-${pickerOpen ? 'up' : 'down'}"></i>`
+            : `<span class="iig-library-picker-copy"><strong>${selectedKind === 'char' ? t`Select a character` : t`Select a persona`}</strong></span><i class="fa-solid fa-chevron-${pickerOpen ? 'up' : 'down'}"></i>`;
+    }
+    panel?.classList.toggle('iig-hidden', !pickerOpen);
 }
 
 async function renderEntityList(settings = getSettings()) {
@@ -345,10 +424,23 @@ async function renderEntityList(settings = getSettings()) {
     if (!currentSelection || !entities.some((entity) => entity.key === currentSelection)) {
         selectedKeys[selectedKind] = entities.find((entity) => entity.active)?.key || entities[0]?.key || '';
     }
+    const availableTags = [...new Set(entities.flatMap((entity) => entity.tags || []))]
+        .sort((a, b) => a.localeCompare(b));
+    if (tagFilter && !availableTags.includes(tagFilter)) tagFilter = '';
+    const tagSelect = document.getElementById('iig_library_tag_filter');
+    if (tagSelect instanceof HTMLSelectElement) {
+        tagSelect.innerHTML = `<option value="">${t`All tags`}</option>${availableTags.map((tag) => `<option value="${sanitizeForHtml(tag)}">${sanitizeForHtml(tag)}</option>`).join('')}`;
+        tagSelect.value = tagFilter;
+    }
+    const sourceSelect = document.getElementById('iig_library_source_filter');
+    if (sourceSelect instanceof HTMLSelectElement) sourceSelect.value = sourceFilter;
     const query = searchQuery.trim().toLowerCase();
-    const matchedEntities = query
-        ? entities.filter((entity) => `${entity.title} ${entity.fallbackTitle} ${entity.key}`.toLowerCase().includes(query))
-        : entities;
+    const matchedEntities = entities.filter((entity) => {
+        if (sourceFilter === 'custom' && !entity.custom) return false;
+        if (sourceFilter === 'linked' && entity.custom) return false;
+        if (tagFilter && !(entity.tags || []).includes(tagFilter)) return false;
+        return !query || `${entity.title} ${entity.fallbackTitle} ${entity.key} ${(entity.tags || []).join(' ')}`.toLowerCase().includes(query);
+    });
     const visibleEntities = matchedEntities.slice(0, MAX_RENDERED_ENTITIES);
     const limitNote = matchedEntities.length > visibleEntities.length
         ? `<div class="iig-library-list-note">${t`Showing ${visibleEntities.length} of ${matchedEntities.length}. Use search to narrow the list.`}</div>`
@@ -356,7 +448,7 @@ async function renderEntityList(settings = getSettings()) {
     host.innerHTML = visibleEntities.length
         ? visibleEntities.map((entity) => buildEntityOptionHtml(entity, selectedKeys[selectedKind])).join('') + limitNote
         : `<div class="iig-library-empty">${selectedKind === 'char' ? t`No characters found.` : t`No personas found.`}</div>`;
-    observeLibraryImages();
+    syncPickerUi(entities.find((entity) => entity.key === selectedKeys[selectedKind]) || null);
     return entities;
 }
 
@@ -376,10 +468,10 @@ async function renderEditor(settings = getSettings(), entities = null) {
         ? getCharacterLibraryEntry(selectedKind, entity.key, settings, { create: false }) || emptyLibraryEntry()
         : emptyLibraryEntry();
     host.innerHTML = buildEditorHtml(entity, entry);
-    observeLibraryImages();
 }
 
 export async function renderCharacterLibrary(settings = getSettings()) {
+    await migrateLegacyAvatarLibrary(settings);
     document.querySelectorAll('.iig-library-tab').forEach((tab) => {
         tab.classList.toggle('selected', tab.getAttribute('data-library-tab') === selectedKind);
     });
@@ -467,44 +559,45 @@ async function handleUrlUpload(target, settings) {
     }
 }
 
-async function refreshCharacterGenerations(state, button, settings) {
-    const folder = String(state.editor.getAttribute('data-generation-folder') || '').trim();
-    if (!folder) {
-        toastr.warning(t`Character image folder is unavailable`, t`Image Generation`);
+async function handleReferenceVision(button, target, settings) {
+    const state = getActiveEditor(settings);
+    if (!state || !(button instanceof HTMLButtonElement)) return;
+    const item = target === 'primary' ? null : findById(state.entry.appearanceItems, target);
+    const previewImage = target === 'primary'
+        ? state.editor.querySelector('.iig-library-primary-preview img')
+        : button.closest('.iig-library-appearance-row')?.querySelector('.iig-library-appearance-preview img');
+    const imagePath = target === 'primary'
+        ? String(previewImage?.getAttribute('src') || '').trim()
+        : normalizeStoredImagePath(item?.imagePath);
+    if (!imagePath) {
+        toastr.warning(t`No image for this reference`, t`Image Generation`);
         return;
     }
+
+    const originalHtml = button.innerHTML;
     button.disabled = true;
-    button.querySelector('i')?.classList.add('fa-spin');
+    button.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i>';
     try {
-        const context = getContext();
-        const folderImagePaths = await listCharacterGenerationPaths(folder);
-        const contextChatCandidates = state.key === getCurrentCharacterReferenceKey()
-            ? [...new Set([...(Array.isArray(context.chat) ? context.chat : [])]
-                .reverse()
-                .flatMap((message) => extractGeneratedImageUrlsFromText(getMessageRenderText(message, settings)))
-                .filter((path) => /\.(?:png|jpe?g|webp|gif)(?:[?#].*)?$/i.test(path)))]
-            : [];
-        const contextChatPaths = (await Promise.all(contextChatCandidates.map(async (path) => {
-            try {
-                const imageResponse = await fetch(path, { method: 'HEAD' });
-                return imageResponse.ok ? path : '';
-            } catch (_error) {
-                return '';
-            }
-        }))).filter(Boolean);
-        const generations = syncCharacterGenerationHistory(
-            state.key,
-            [...contextChatPaths, ...folderImagePaths],
-            settings,
-        );
-        await renderEditor(settings);
-        toastr.success(t`Generations found: ${generations.length}`, t`Image Generation`);
+        const imageBase64 = await imageUrlToBase64(imagePath);
+        if (!imageBase64) throw new Error(t`Failed to load reference image`);
+        const description = await callVisionApi(imageBase64, DEFAULT_REFERENCE_APPEARANCE_VISION_PROMPT);
+        if (target === 'primary') {
+            state.entry.primary.description = description;
+            const textarea = state.editor.querySelector('.iig-library-primary-description');
+            if (textarea instanceof HTMLTextAreaElement) textarea.value = description;
+        } else if (item?.type === 'image') {
+            item.description = description;
+            const textarea = button.closest('.iig-library-appearance-row')?.querySelector('.iig-library-appearance-description');
+            if (textarea instanceof HTMLTextAreaElement) textarea.value = description;
+        }
+        saveSettings();
+        toastr.success(t`Description generated`, t`Image Generation`);
     } catch (error) {
-        console.error('[IIG] Failed to refresh character generations:', error);
-        toastr.error(t`Failed to refresh generations: ${error.message || error}`, t`Image Generation`);
+        console.error('[IIG] Character library Vision failed:', error);
+        toastr.error(t`Vision generation error: ${error.message || error}`, t`Image Generation`);
     } finally {
         button.disabled = false;
-        button.querySelector('i')?.classList.remove('fa-spin');
+        button.innerHTML = originalHtml;
     }
 }
 
@@ -516,6 +609,8 @@ async function getContextSignature(settings = getSettings()) {
         characterId: context?.characterId ?? null,
         characters: characters.map((character) => [character?.name || '', character?.avatar || '']),
         activeUserKey,
+        activeCustomChar: getActiveCustomCharacterLibraryProfileKey('char', settings),
+        activeCustomUser: getActiveCustomCharacterLibraryProfileKey('user', settings),
         userAvatarFile: settings.userAvatarFile || '',
         useActiveUserPersonaAvatar: Boolean(settings.useActiveUserPersonaAvatar),
     });
@@ -537,11 +632,11 @@ async function refreshIfContextChanged(settings = getSettings(), { force = false
 
 async function syncLibrarySelectionToContext(settings, sync) {
     if (sync.character) {
-        const characterKey = getCurrentCharacterReferenceKey();
+        const characterKey = getActiveCustomCharacterLibraryProfileKey('char', settings) || getCurrentCharacterReferenceKey();
         selectedKeys.char = characterKey === 'no-character' ? '' : characterKey;
     }
     if (sync.user) {
-        selectedKeys.user = await getCurrentUserReferenceKey(settings);
+        selectedKeys.user = getActiveCustomCharacterLibraryProfileKey('user', settings) || await getCurrentUserReferenceKey(settings);
     }
 }
 
@@ -609,18 +704,35 @@ export function bindCharacterLibraryEvents(settings = getSettings()) {
         const state = getActiveEditor(settings);
         if (!state) return;
         if (target.classList.contains('iig-library-display-name')) state.entry.displayName = target.value;
+        if (target.classList.contains('iig-library-trigger-keywords')) state.entry.triggerKeywords = target.value;
+        if (target.classList.contains('iig-library-tags')) {
+            state.entry.tags = [...new Set(target.value.split(',').map((tag) => tag.trim()).filter(Boolean))];
+        }
         if (target.classList.contains('iig-library-primary-description')) state.entry.primary.description = target.value;
 
         const appearanceRow = target.closest('.iig-library-appearance-row');
         const item = findById(state.entry.appearanceItems, String(appearanceRow?.getAttribute('data-appearance-id') || ''));
         if (item && target.classList.contains('iig-library-appearance-description')) item.description = target.value;
         saveSettings();
-        if (target.classList.contains('iig-library-display-name')) renderEntityList(settings).catch(() => {});
+        if (target.classList.contains('iig-library-display-name') || target.classList.contains('iig-library-tags')) {
+            renderEntityList(settings).catch(() => {});
+        }
     });
 
     section.addEventListener('change', async (event) => {
         const target = event.target;
+        if (target instanceof HTMLSelectElement) {
+            if (target.id === 'iig_library_source_filter') sourceFilter = ['linked', 'custom'].includes(target.value) ? target.value : 'all';
+            if (target.id === 'iig_library_tag_filter') tagFilter = target.value;
+            await renderEntityList(settings);
+            return;
+        }
         if (!(target instanceof HTMLInputElement)) return;
+        if (target.id === 'iig_library_optional_send') {
+            settings.optionalAvatarSending = target.checked;
+            saveSettings();
+            return;
+        }
         if (target.type === 'file') {
             await handleFileUpload(target, settings);
             return;
@@ -649,6 +761,29 @@ export function bindCharacterLibraryEvents(settings = getSettings()) {
         const tab = target.closest('.iig-library-tab');
         if (tab) {
             selectedKind = tab.getAttribute('data-library-tab') === 'user' ? 'user' : 'char';
+            searchQuery = '';
+            pickerOpen = true;
+            await renderCharacterLibrary(settings);
+            document.getElementById('iig_library_search')?.focus();
+            return;
+        }
+        if (target.closest('#iig_library_picker_toggle')) {
+            pickerOpen = !pickerOpen;
+            const entities = await getEntities(selectedKind, settings);
+            syncPickerUi(entities.find((entity) => entity.key === selectedKeys[selectedKind]) || null);
+            if (pickerOpen) document.getElementById('iig_library_search')?.focus();
+            return;
+        }
+        if (target.closest('#iig_library_create_profile')) {
+            const label = selectedKind === 'char' ? t`New character profile` : t`New persona profile`;
+            const name = await Popup.show.input(t`Add custom profile`, t`Profile name:`, label);
+            if (!String(name || '').trim()) return;
+            const profile = createCustomCharacterLibraryProfile(selectedKind, name, settings);
+            selectedKeys[selectedKind] = profile.key;
+            sourceFilter = 'custom';
+            tagFilter = '';
+            searchQuery = '';
+            pickerOpen = false;
             await renderCharacterLibrary(settings);
             return;
         }
@@ -656,15 +791,31 @@ export function bindCharacterLibraryEvents(settings = getSettings()) {
         if (entityButton) {
             selectedKind = entityButton.getAttribute('data-library-kind') === 'user' ? 'user' : 'char';
             selectedKeys[selectedKind] = String(entityButton.getAttribute('data-library-key') || '');
+            searchQuery = '';
+            pickerOpen = false;
             await renderCharacterLibrary(settings);
             return;
         }
 
         const state = getActiveEditor(settings);
         if (!state) return;
-        const generationsRefresh = target.closest('.iig-library-generations-refresh');
-        if (generationsRefresh instanceof HTMLButtonElement && state.kind === 'char') {
-            await refreshCharacterGenerations(state, generationsRefresh, settings);
+        const activeProfileButton = target.closest('.iig-library-profile-active');
+        if (activeProfileButton) {
+            const isActive = getActiveCustomCharacterLibraryProfileKey(state.kind, settings) === state.key;
+            setActiveCustomCharacterLibraryProfile(state.kind, isActive ? '' : state.key, settings);
+            await renderCharacterLibrary(settings);
+            return;
+        }
+        const primaryVision = target.closest('.iig-library-primary-vision');
+        if (primaryVision) {
+            await handleReferenceVision(primaryVision, 'primary', settings);
+            return;
+        }
+        const appearanceVision = target.closest('.iig-library-reference-vision');
+        if (appearanceVision) {
+            const row = appearanceVision.closest('.iig-library-appearance-row.image');
+            const id = String(row?.getAttribute('data-appearance-id') || '');
+            if (id) await handleReferenceVision(appearanceVision, id, settings);
             return;
         }
         const addAppearanceButton = target.closest('.iig-library-appearance-add');
@@ -708,7 +859,10 @@ export function bindCharacterLibraryEvents(settings = getSettings()) {
             return;
         }
         if (target.closest('.iig-library-entry-delete')) {
-            const confirmed = await Popup.show.confirm(t`Clear all reference settings for this entry?`, t`Confirm`);
+            const confirmed = await Popup.show.confirm(
+                state.entry.custom ? t`Delete this custom profile?` : t`Clear all reference settings for this entry?`,
+                t`Confirm`,
+            );
             if (!confirmed) return;
             deleteCharacterLibraryEntry(state.kind, state.key, settings);
             await renderCharacterLibrary(settings);

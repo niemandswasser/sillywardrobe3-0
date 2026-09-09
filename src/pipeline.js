@@ -15,16 +15,13 @@ import {
     getEffectiveRefInstruction,
     setLastRequestSnapshot,
     normalizeNaisteraModel,
-    isNaisteraNovelAIModel,
-    normalizeNaisteraCharacterDescriptionsMode,
 } from './settings.js';
 import {
     saveImageToFile,
     saveNaisteraMediaToFile,
     ERROR_IMAGE_PATH,
-    STOPPED_IMAGE_PATH,
+    decodeHtmlEntities,
     parseImageDataUrl,
-    abortableDelay,
     ProviderError,
 } from './utils.js';
 import {
@@ -37,6 +34,7 @@ import {
     getInstructionAttributeValue,
     getMatchedAdditionalReferences,
     isGeneratedVideoResult,
+    parseInstructionObject,
     parseMessageImageTags,
     replaceTagInMessageSource,
     rerenderMessageHtml,
@@ -45,12 +43,7 @@ import {
     resolveActiveProvider,
     validateSettings,
 } from './providers.js';
-import {
-    getReferenceDescription,
-    getReferenceImage,
-    recordCharacterGeneration,
-    buildCharacterDescriptionPromptBlock,
-} from './references.js';
+import { buildActiveCharacterLibraryPromptBlock, getReferenceDescription, getReferenceImage, getReferenceSource, recordCharacterGeneration } from './references.js';
 import { t } from './i18n.js';
 
 // ----- Friendly error classification -----
@@ -182,7 +175,7 @@ function formatProviderError(error) {
  * reference images — OpenAI / ElectronHub (/v1/images/edits), Gemini,
  * OpenRouter, Naistera.
  */
-const REF_INSTRUCTION_PROVIDERS = new Set(['openai', 'xai', 'electronhub', 'gemini', 'openrouter', 'naistera']);
+const REF_INSTRUCTION_PROVIDERS = new Set(['openai', 'electronhub', 'gemini', 'openrouter', 'naistera', 'novelai']);
 
 /**
  * Приводит любой представление референса (base64 строка или data URL)
@@ -194,60 +187,21 @@ function refToPreviewDataUrl(ref) {
     return value.startsWith('data:') ? value : `data:image/png;base64,${value}`;
 }
 
-function referenceSource(ref) {
-    if (ref && typeof ref === 'object' && !Array.isArray(ref)) {
-        return String(ref.source || '').trim();
-    }
-    return '';
-}
-
-function buildAvatarReferenceSnapshotBlock(references = [], settings = getSettings()) {
-    if (settings.sendRefDescriptions === false) {
-        return '';
-    }
-
-    const lines = references
-        .map((ref, index) => {
-            const source = referenceSource(ref);
-            if (source !== 'char' && source !== 'user') {
-                return '';
-            }
-            const description = getReferenceDescription(ref);
-            if (!description) {
-                return '';
-            }
-            const label = source === 'char' ? '{{char}} avatar' : '{{user}} avatar';
-            return `- Reference ${index + 1} (${label}): ${description}`;
-        })
-        .filter(Boolean);
-
-    return lines.length > 0
-        ? `Character reference descriptions:\n${lines.join('\n')}`
-        : '';
-}
-
 /**
  * Строит snapshot финального запроса для in-memory отображения в UI.
  * Воспроизводит apiType-зависимую логику сборки prompt'а (refInstruction
  * префикс только для провайдеров из REF_INSTRUCTION_PROVIDERS).
  */
-function buildRequestSnapshot({ prompt, style, references, matchedAdditionalRefs, options, provider, settings, characterDescriptionPromptBlock = '', wrapStyle = true }) {
+function buildRequestSnapshot({ prompt, style, references, matchedAdditionalRefs, options, provider, settings }) {
+    const includeReferencePromptBlocks = !(settings.apiType === 'novelai'
+        && settings.novelaiEnableReferences === false);
     let snapshotPrompt = buildFinalGenerationPrompt(
         prompt,
         style,
-        matchedAdditionalRefs || [],
+        includeReferencePromptBlocks ? (matchedAdditionalRefs || []) : [],
         settings,
-        { wrapStyle },
+        { includeReferencePromptBlocks },
     );
-    if (settings.apiType === 'openai' || settings.apiType === 'xai' || settings.apiType === 'electronhub') {
-        const avatarDescriptions = buildAvatarReferenceSnapshotBlock(references, settings);
-        if (avatarDescriptions) {
-            snapshotPrompt = `${snapshotPrompt}\n\n${avatarDescriptions}`.trim();
-        }
-    }
-    if (characterDescriptionPromptBlock) {
-        snapshotPrompt = `${snapshotPrompt}\n\n${characterDescriptionPromptBlock}`.trim();
-    }
     let refInstructionApplied = false;
 
     if (references.length > 0 && REF_INSTRUCTION_PROVIDERS.has(settings.apiType)) {
@@ -260,13 +214,13 @@ function buildRequestSnapshot({ prompt, style, references, matchedAdditionalRefs
 
     const model = settings.apiType === 'naistera'
         ? normalizeNaisteraModel(settings.naisteraModel)
-        : (settings.model || '');
+        : settings.apiType === 'novelai'
+            ? (settings.novelaiModel === '__custom__' ? (settings.novelaiCustomModel || '') : (settings.novelaiModel || ''))
+            : (settings.model || '');
 
     const aspectRatio = settings.apiType === 'naistera'
         ? (options?.aspectRatio || settings.naisteraAspectRatio)
-        : settings.apiType === 'xai'
-            ? (options?.aspectRatio || settings.xaiAspectRatio)
-            : (options?.aspectRatio || settings.aspectRatio);
+        : (options?.aspectRatio || settings.aspectRatio);
 
     const matchedRefsInfo = (Array.isArray(matchedAdditionalRefs) ? matchedAdditionalRefs : []).map((ref) => ({
         name: String(ref?.name || ''),
@@ -275,19 +229,13 @@ function buildRequestSnapshot({ prompt, style, references, matchedAdditionalRefs
         lorebookName: String(ref?._lorebookName || ''),
         reason: ref?._matchReason || null,
     }));
-    const negativePrompt = settings.apiType === 'naistera' && provider?.supportsNegativePrompt(settings)
-        ? String(options?.negativePrompt ?? settings.naisteraNegativePrompt ?? '').trim()
-        : '';
 
     return {
         timestamp: Date.now(),
         prompt: snapshotPrompt,
-        negativePrompt,
         references: references.map((ref, index) => ({
             dataUrl: refToPreviewDataUrl(ref),
             label: `ref ${index + 1}`,
-            description: getReferenceDescription(ref),
-            source: referenceSource(ref),
         })),
         matchedRefs: matchedRefsInfo,
         metadata: {
@@ -295,13 +243,9 @@ function buildRequestSnapshot({ prompt, style, references, matchedAdditionalRefs
             apiType: settings.apiType,
             model,
             aspectRatio,
-            imageSize: settings.apiType === 'xai'
-                ? (options?.imageSize || settings.xaiResolution || '')
-                : (options?.imageSize || settings.imageSize || ''),
+            imageSize: options?.imageSize || settings.imageSize || '',
             size: settings.size || '',
-            quality: settings.apiType === 'xai'
-                ? (options?.quality || settings.xaiQuality || '')
-                : (options?.quality || settings.quality || ''),
+            quality: options?.quality || settings.quality || '',
             refInstructionApplied,
         },
     };
@@ -310,93 +254,84 @@ function buildRequestSnapshot({ prompt, style, references, matchedAdditionalRefs
 // Set of messageIds currently being processed (shared between processMessageTags
 // and regenerate to prevent double-runs).
 export const processingMessages = new Set();
+const activeSingleTagTasks = new Set();
+let chatSaveQueue = Promise.resolve();
 
-const tagAbortControllers = new Map();
+function singleTagTaskKey(messageId, tagIndex) {
+    return `${messageId}:${tagIndex}`;
+}
 
-export function abortGenerationForTag(tagId) {
-    const controller = tagAbortControllers.get(String(tagId || ''));
-    if (controller) {
-        controller.abort('user-cancel');
-        return true;
-    }
-    return false;
+function queueChatSave(context) {
+    const next = chatSaveQueue
+        .catch(() => undefined)
+        .then(() => context.saveChat());
+    chatSaveQueue = next;
+    return next;
 }
 
 // ----- Placeholder DOM helpers -----
 
-let timerIntervalId = null;
-
-function formatElapsed(ms) {
-    const sec = Math.max(0, Math.floor(ms / 1000));
-    const m = Math.floor(sec / 60);
-    const s = sec % 60;
-    return `${m}:${String(s).padStart(2, '0')}`;
-}
-
-function tickTimers() {
-    const placeholders = document.querySelectorAll('.iig-loading-placeholder[data-iig-start]');
-    if (placeholders.length === 0) {
-        clearInterval(timerIntervalId);
-        timerIntervalId = null;
-        return;
-    }
-    const now = Date.now();
-    for (const ph of placeholders) {
-        const start = Number(ph.dataset.iigStart);
-        if (!start) continue;
-        const timerEl = ph.querySelector('.iig-timer');
-        if (timerEl) timerEl.textContent = formatElapsed(now - start);
-    }
-}
-
-function ensureTimerInterval() {
-    if (timerIntervalId === null) {
-        timerIntervalId = setInterval(tickTimers, 1000);
-    }
-}
-
 export function createLoadingPlaceholder(tagId) {
     const placeholder = document.createElement('div');
+    const abortController = new AbortController();
     placeholder.className = 'iig-loading-placeholder';
     placeholder.dataset.tagId = tagId;
-    placeholder.dataset.iigStart = String(Date.now());
+    placeholder._abortController = abortController;
     placeholder.innerHTML = `
         <div class="iig-spinner"></div>
-        <div class="iig-status">${t`Generating image...`}</div>
-        <div class="iig-timer">0:00</div>
-        <button type="button" class="iig-stop-btn" title="${t`Stop generation`}" aria-label="${t`Stop generation`}">
-            <i class="fa-solid fa-stop"></i>
-            <span>${t`Stop`}</span>
-        </button>
+        <div class="iig-status"><span class="iig-status-label">${t`Generating image...`}</span> <span class="iig-status-timer"></span></div>
+        <button type="button" class="iig-cancel-generation" title="${t`Cancel generation`}"><i class="fa-solid fa-circle-stop"></i><span>${t`Stop generation`}</span></button>
     `;
-    const stopBtn = placeholder.querySelector('.iig-stop-btn');
-    if (stopBtn instanceof HTMLButtonElement) {
-        stopBtn.addEventListener('click', (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            stopBtn.disabled = true;
-            stopBtn.querySelector('span').textContent = t`Stopping...`;
-            abortGenerationForTag(tagId);
-        });
-    }
-    ensureTimerInterval();
+
+    const cancelButton = placeholder.querySelector('.iig-cancel-generation');
+    cancelButton?.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (abortController.signal.aborted) return;
+        cancelButton.disabled = true;
+        placeholder.classList.add('iig-generation-cancelling');
+        const label = placeholder.querySelector('.iig-status-label');
+        if (label) label.textContent = t`Cancelling...`;
+        abortController.abort(new DOMException(t`Generation cancelled by user`, 'AbortError'));
+    });
+
+    const timerEl = placeholder.querySelector('.iig-status-timer');
+    const startedAt = Date.now();
+    const updateTimer = () => {
+        if (!timerEl?.isConnected) {
+            clearLoadingPlaceholderTimer(placeholder);
+            return;
+        }
+        const elapsed = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+        const minutes = Math.floor(elapsed / 60);
+        const seconds = elapsed % 60;
+        timerEl.textContent = `(${minutes}:${String(seconds).padStart(2, '0')})`;
+    };
+    updateTimer();
+    placeholder._timerInterval = setInterval(updateTimer, 1000);
     return placeholder;
 }
 
-export function createStoppedPlaceholder(tagId, tagInfo) {
-    const img = document.createElement('img');
-    img.className = 'iig-error-image iig-stopped-image';
-    img.src = STOPPED_IMAGE_PATH;
-    img.alt = t`Generation stopped`;
-    img.title = t`Generation stopped by user. Click to retry.`;
-    img.dataset.tagId = tagId;
-    if (tagInfo?.fullMatch) {
-        const instructionMatch = tagInfo.fullMatch.match(/data-iig-instruction\s*=\s*(['"])([\s\S]*?)\1/i);
-        if (instructionMatch) {
-            img.setAttribute('data-iig-instruction', instructionMatch[2]);
-        }
+function getLoadingSignal(placeholder) {
+    return placeholder?._abortController?.signal || null;
+}
+
+function finishLoadingGeneration(placeholder) {
+    const signal = getLoadingSignal(placeholder);
+    if (signal?.aborted) throw signal.reason || new DOMException(t`Generation cancelled by user`, 'AbortError');
+    const cancelButton = placeholder?.querySelector('.iig-cancel-generation');
+    if (cancelButton) cancelButton.disabled = true;
+}
+
+function isGenerationCancelled(error, signal = null) {
+    return !!signal?.aborted || error?.name === 'AbortError' || error?.code === 'generation_cancelled';
+}
+
+export function clearLoadingPlaceholderTimer(placeholder) {
+    if (placeholder?._timerInterval) {
+        clearInterval(placeholder._timerInterval);
+        placeholder._timerInterval = null;
     }
-    return img;
 }
 
 export function createErrorPlaceholder(tagId, errorMessage, tagInfo, friendlyInfo = null) {
@@ -482,10 +417,21 @@ export async function generateImageWithRetry(prompt, style, onStatusUpdate, opti
         throw new Error(t`Unknown API: ${settings.apiType}`);
     }
 
+    if (settings.overrideAspectRatio) {
+        options.aspectRatio = null;
+    }
+    if (settings.overrideImageSize) {
+        options.imageSize = null;
+    }
+
     const maxRetries = settings.maxRetries;
     const baseDelay = settings.retryDelay;
 
-    const matchedAdditionalRefs = getMatchedAdditionalReferences(prompt);
+    const novelaiReferencesDisabled = settings.apiType === 'novelai'
+        && settings.novelaiEnableReferences === false;
+    const matchedAdditionalRefs = novelaiReferencesDisabled
+        ? []
+        : getMatchedAdditionalReferences(prompt);
     if (matchedAdditionalRefs.length > 0) {
         iigLog(
             'INFO',
@@ -500,39 +446,6 @@ export async function generateImageWithRetry(prompt, style, onStatusUpdate, opti
         matchedAdditionalRefs,
         providerOptions: options,
     });
-    const naisteraDescriptionMode = normalizeNaisteraCharacterDescriptionsMode(settings.naisteraCharacterDescriptionsMode);
-    const characterDescriptionPromptBlock = settings.apiType === 'naistera'
-        ? await buildCharacterDescriptionPromptBlock({
-            includeChar: true,
-            includeUser: true,
-            references,
-            mode: naisteraDescriptionMode,
-        }, settings)
-        : '';
-    const wrapStyle = !(settings.apiType === 'naistera' && isNaisteraNovelAIModel(settings.naisteraModel));
-
-    iigLog('INFO', `References collected for ${settings.apiType}: ${references.length} ref(s)`);
-    for (let i = 0; i < references.length; i++) {
-        const ref = references[i];
-        const src = referenceSource(ref) || '?';
-        const desc = getReferenceDescription(ref);
-        const img = getReferenceImage(ref);
-        const imgInfo = img.startsWith('data:')
-            ? `data-url(${img.length} chars)`
-            : (img ? `base64(${img.length} chars)` : 'EMPTY');
-        const descPreview = desc ? `"${desc.substring(0, 100)}${desc.length > 100 ? '…' : ''}"` : '(no description)';
-        iigLog('INFO', `  ref[${i}] source=${src} desc=${descPreview} img=${imgInfo}`);
-    }
-    iigLog(
-        'INFO',
-        `Prompt: ${prompt.length} chars, style="${style || ''}", options=${JSON.stringify({
-            aspectRatio: options.aspectRatio,
-            imageSize: options.imageSize,
-            quality: options.quality,
-            preset: options.preset,
-            messageId: options.messageId,
-        })}`
-    );
 
     // Записываем snapshot (in-memory, перезатирается на каждой генерации) для
     // кнопки «Show last request» в настройках. Делаем до generate, чтобы
@@ -545,38 +458,31 @@ export async function generateImageWithRetry(prompt, style, onStatusUpdate, opti
         options,
         provider,
         settings,
-        characterDescriptionPromptBlock,
-        wrapStyle,
     }));
 
     let lastError;
-    const externalSignal = options.signal || null;
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
-        if (externalSignal?.aborted) {
-            throw new ProviderError({
-                message: t`Generation stopped by user`,
-                code: 'aborted',
-                retryable: false,
-                providerId: settings.apiType || '',
-            });
-        }
         try {
+            if (options.signal?.aborted) {
+                throw options.signal.reason || new DOMException(t`Generation cancelled by user`, 'AbortError');
+            }
             const statusText = attempt > 0
                 ? t`Generating (retry ${attempt}/${maxRetries})...`
                 : t`Generating...`;
             onStatusUpdate?.(statusText);
 
+            const libraryPromptBlock = settings.apiType === 'gemini' || novelaiReferencesDisabled
+                ? ''
+                : await buildActiveCharacterLibraryPromptBlock(settings, prompt);
+            const requestPrompt = libraryPromptBlock ? `${prompt}\n\n${libraryPromptBlock}` : prompt;
             const generated = await provider.generate({
-                prompt,
+                prompt: requestPrompt,
                 style,
                 references,
                 options: {
                     ...options,
                     matchedAdditionalRefs,
-                    characterDescriptionPromptBlock,
-                    wrapStyle,
-                    signal: externalSignal,
                 },
             });
 
@@ -607,7 +513,11 @@ export async function generateImageWithRetry(prompt, style, onStatusUpdate, opti
             return generated;
         } catch (error) {
             lastError = error;
-            iigLog('ERROR', `Generation attempt ${attempt + 1} failed:`, error);
+            console.error(`[IIG] Generation attempt ${attempt + 1} failed:`, error);
+
+            if (isGenerationCancelled(error, options.signal)) {
+                throw options.signal?.reason || error;
+            }
 
             // ProviderError даёт `retryable` явно. Для прочих ошибок (напр.
             // всплывших из saveImageToFile / внутренностей JS) — fallback на
@@ -630,7 +540,13 @@ export async function generateImageWithRetry(prompt, style, onStatusUpdate, opti
 
             const delay = baseDelay * Math.pow(2, attempt);
             onStatusUpdate?.(t`Retry in ${delay / 1000}s...`);
-            await abortableDelay(delay, externalSignal);
+            await new Promise((resolve, reject) => {
+                const timer = setTimeout(resolve, delay);
+                options.signal?.addEventListener('abort', () => {
+                    clearTimeout(timer);
+                    reject(options.signal.reason || new DOMException(t`Generation cancelled by user`, 'AbortError'));
+                }, { once: true });
+            });
         }
     }
 
@@ -651,17 +567,12 @@ export async function processMessageTags(messageId) {
     }
 
     const message = context.chat[messageId];
-    if (!message) return;
-    // User messages are processed only when the toggle is on.
-    if (message.is_user && !settings.processUserMessages) return;
+    if (!message || message.is_user) return;
 
     const tags = await parseMessageImageTags(message, { checkExistence: true });
-    iigLog('INFO', `parseImageTags returned: ${tags.length} tags (message ${messageId}, is_user=${!!message.is_user})`);
-    for (let i = 0; i < tags.length; i++) {
-        const t = tags[i];
-        const promptPreview = String(t.prompt || '').substring(0, 60);
-        const srcPreview = String(t.existingSrc || '').substring(0, 50);
-        iigLog('INFO', `  tag[${i}] prompt="${promptPreview}" newFormat=${!!t.isNewFormat} src="${srcPreview}"`);
+    iigLog('INFO', `parseImageTags returned: ${tags.length} tags`);
+    if (tags.length > 0) {
+        iigLog('INFO', `First tag: ${JSON.stringify(tags[0]).substring(0, 200)}`);
     }
     if (tags.length === 0) {
         iigLog('INFO', 'No tags found by parser');
@@ -677,15 +588,11 @@ export async function processMessageTags(messageId) {
     if (!messageElement) {
         console.error('[IIG] Message element not found for ID:', messageId);
         toastr.error(t`Could not locate message element`, t`Image Generation`);
-        processingMessages.delete(messageId);
         return;
     }
 
     const mesTextEl = messageElement.querySelector('.mes_text');
-    if (!mesTextEl) {
-        processingMessages.delete(messageId);
-        return;
-    }
+    if (!mesTextEl) return;
 
     const convertedLegacyTags = convertLegacyTagsToInstructionFormat(message, tags);
 
@@ -710,67 +617,50 @@ export async function processMessageTags(messageId) {
         const searchPrompt = tag.prompt.substring(0, 30);
         iigLog('INFO', `Searching for prompt starting with: "${searchPrompt}"`);
 
-        const isPendingDomMedia = (img) => {
-            const src = img.getAttribute('src') || '';
-            return src.includes('[IMG:GEN]')
-                || src.includes('[IMG:ERROR]')
-                || src === ''
-                || src === '#'
-                || (tag.existingSrc && src === tag.existingSrc);
-        };
-
-        const decodeEntities = (str) => String(str || '')
-            .replace(/&quot;/g, '"')
-            .replace(/&apos;/g, "'")
-            .replace(/&#39;/g, "'")
-            .replace(/&#34;/g, '"')
-            .replace(/&amp;/g, '&');
-
-        const normalizedSearchPrompt = decodeEntities(searchPrompt);
-
-        const matchesByPrompt = (img) => {
+        for (const img of allImgs) {
             const instruction = img.getAttribute('data-iig-instruction');
-            if (!instruction) return false;
-            const decoded = decodeEntities(instruction);
-            if (decoded.includes(normalizedSearchPrompt)) return true;
-            if (instruction.includes(searchPrompt)) return true;
-            try {
-                const data = JSON.parse(decoded.replace(/'/g, '"'));
-                if (data?.prompt && data.prompt.substring(0, 30) === tag.prompt.substring(0, 30)) return true;
-            } catch {}
-            return false;
-        };
+            const src = img.getAttribute('src') || '';
+            iigLog('INFO', `DOM img - src: "${src.substring(0, 50)}", instruction (first 100): "${instruction?.substring(0, 100)}"`);
 
-        const indexedCandidate = allImgs[index];
-        if (indexedCandidate && isPendingDomMedia(indexedCandidate)) {
-            targetElement = indexedCandidate;
-            iigLog('INFO', `Found media element via pending DOM index ${index}`);
-        }
+            if (instruction) {
+                // Strategy 1: Decode HTML entities and normalize quotes, then match
+                const decodedInstruction = decodeHtmlEntities(instruction);
+                const normalizedSearchPrompt = decodeHtmlEntities(searchPrompt);
 
-        if (!targetElement) {
-            for (const img of allImgs) {
-                if (!matchesByPrompt(img)) continue;
-                targetElement = img;
-                const src = img.getAttribute('src') || '';
-                iigLog('INFO', `Found media element via prompt match (src="${src.substring(0, 60)}", pending=${isPendingDomMedia(img)})`);
-                break;
+                if (decodedInstruction.includes(normalizedSearchPrompt)) {
+                    iigLog('INFO', `Found img element via decoded instruction match`);
+                    targetElement = img;
+                    break;
+                }
+
+                // Strategy 2: Try to parse the instruction as JSON and compare prompts
+                try {
+                    const normalizedJson = decodedInstruction.replace(/'/g, '"');
+                    const instructionData = JSON.parse(normalizedJson);
+                    if (instructionData.prompt && instructionData.prompt.substring(0, 30) === tag.prompt.substring(0, 30)) {
+                        iigLog('INFO', `Found img element via JSON prompt match`);
+                        targetElement = img;
+                        break;
+                    }
+                } catch (e) {
+                    // JSON parse failed, continue with other strategies
+                }
+
+                // Strategy 3: Raw instruction contains raw search prompt (original approach)
+                if (instruction.includes(searchPrompt)) {
+                    iigLog('INFO', `Found img element via raw instruction match`);
+                    targetElement = img;
+                    break;
+                }
             }
         }
 
-        if (!targetElement && allImgs.length === tags.length) {
-            const candidate = allImgs[index];
-            if (candidate) {
-                targetElement = candidate;
-                const src = candidate.getAttribute('src') || '';
-                iigLog('INFO', `Found media element via 1-to-1 positional fallback at index ${index} (src="${src.substring(0, 60)}")`);
-            }
-        }
-
+        // Alternative: find by src containing markers (when prompt matching fails)
         if (!targetElement) {
             iigLog('INFO', `Prompt matching failed, trying src marker matching...`);
             for (const img of allImgs) {
-                if (isPendingDomMedia(img)) {
-                    const src = img.getAttribute('src') || '';
+                const src = img.getAttribute('src') || '';
+                if (src.includes('[IMG:GEN]') || src.includes('[IMG:ERROR]') || src === '' || src === '#') {
                     iigLog('INFO', `Found img element with generation marker in src: "${src}"`);
                     targetElement = img;
                     break;
@@ -778,6 +668,7 @@ export async function processMessageTags(messageId) {
             }
         }
 
+        // Strategy 4: If still not found, try looking at all media nodes
         if (!targetElement) {
             iigLog('INFO', `Trying broader media search...`);
             const allImgsInMes = mesTextEl.querySelectorAll('img, video');
@@ -806,27 +697,24 @@ export async function processMessageTags(messageId) {
             mesTextEl.appendChild(loadingPlaceholder);
         }
 
-        const statusEl = loadingPlaceholder.querySelector('.iig-status');
-
-        const controller = new AbortController();
-        tagAbortControllers.set(tagId, controller);
+        const statusEl = loadingPlaceholder.querySelector('.iig-status-label')
+            || loadingPlaceholder.querySelector('.iig-status');
 
         try {
             const generated = await generateImageWithRetry(
                 tag.prompt,
                 tag.style,
                 (status) => { statusEl.textContent = status; },
-                { aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality, preset: tag.preset, messageId, signal: controller.signal }
+                { aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality, preset: tag.preset, messageId, signal: getLoadingSignal(loadingPlaceholder) }
             );
-
+            finishLoadingGeneration(loadingPlaceholder);
+            clearLoadingPlaceholderTimer(loadingPlaceholder);
             const { persistedSrc, persistedPosterSrc } = await persistGeneratedMedia(
                 generated,
                 statusEl,
                 { messageId, tagIndex: index, mode: 'generate' }
             );
-            if (!isGeneratedVideoResult(generated)) {
-                recordCharacterGeneration(persistedSrc, tag.prompt, settings);
-            }
+            if (!isGeneratedVideoResult(generated)) recordCharacterGeneration(persistedSrc, tag.prompt, getSettings());
 
             const mediaElement = createGeneratedMediaElement(
                 isGeneratedVideoResult(generated)
@@ -839,6 +727,7 @@ export async function processMessageTags(messageId) {
             if (instructionValue) {
                 mediaElement.setAttribute('data-iig-instruction', instructionValue);
             }
+            mediaElement.dataset.iigTagIndex = String(index);
 
             loadingPlaceholder.replaceWith(mediaElement);
 
@@ -851,52 +740,41 @@ export async function processMessageTags(messageId) {
                 : t`Image ${index + 1}/${tags.length} ready`;
             toastr.success(readyMsg, t`Image Generation`, { timeOut: 2000 });
         } catch (error) {
-            const wasAborted = error instanceof ProviderError && error.code === 'aborted';
-            if (wasAborted) {
-                iigLog('INFO', `Generation stopped by user for tag ${index}`);
-                const stoppedPlaceholder = createStoppedPlaceholder(tagId, tag);
-                loadingPlaceholder.replaceWith(stoppedPlaceholder);
-                if (tag.isNewFormat) {
-                    const stoppedTag = buildPersistedImageTag(tag, STOPPED_IMAGE_PATH);
-                    replaceTagInMessageSource(message, tag, stoppedTag);
-                } else {
-                    replaceTagInMessageSource(message, tag, `[IMG:STOPPED]`);
-                }
-                toastr.info(t`Generation stopped`, t`Image Generation`, { timeOut: 2000 });
+            clearLoadingPlaceholderTimer(loadingPlaceholder);
+            const cancelled = isGenerationCancelled(error, getLoadingSignal(loadingPlaceholder));
+            iigLog(cancelled ? 'INFO' : 'ERROR', `${cancelled ? 'Cancelled' : 'Failed to generate'} image for tag ${index}:`, error.message);
+            const friendly = cancelled
+                ? { title: t`Generation cancelled`, message: t`Generation was cancelled by the user.`, detail: '' }
+                : formatProviderError(error);
+
+            const errorPlaceholder = createErrorPlaceholder(tagId, error.message, tag, friendly);
+            errorPlaceholder.dataset.iigTagIndex = String(index);
+            loadingPlaceholder.replaceWith(errorPlaceholder);
+
+            // IMPORTANT: Mark tag as failed in message.mes so it displays after swipe.
+            if (tag.isNewFormat) {
+                const errorTag = tag.fullMatch.replace(/src\s*=\s*(['"])[^'"]*\1/i, `src="${ERROR_IMAGE_PATH}"`);
+                replaceTagInMessageSource(message, tag, errorTag);
             } else {
-                iigLog('ERROR', `Failed to generate image for tag ${index}:`, error);
-                const friendly = formatProviderError(error);
-
-                const errorPlaceholder = createErrorPlaceholder(tagId, error.message, tag, friendly);
-                loadingPlaceholder.replaceWith(errorPlaceholder);
-
-                if (tag.isNewFormat) {
-                    const errorTag = buildPersistedImageTag(tag, ERROR_IMAGE_PATH);
-                    replaceTagInMessageSource(message, tag, errorTag);
-                } else {
-                    const errorMarker = `[IMG:ERROR:${error.message.substring(0, 50)}]`;
-                    replaceTagInMessageSource(message, tag, errorMarker);
-                }
-                iigLog('INFO', `Marked tag as failed in message.mes`);
-
-                toastr.error(friendly.message, friendly.title);
+                const errorMarker = `[IMG:ERROR:${error.message.substring(0, 50)}]`;
+                replaceTagInMessageSource(message, tag, errorMarker);
             }
-        } finally {
-            tagAbortControllers.delete(tagId);
+            iigLog('INFO', `Marked tag as failed in message.mes`);
+
+            if (cancelled) toastr.info(friendly.message, friendly.title, { timeOut: 2500 });
+            else toastr.error(friendly.message, friendly.title);
         }
     };
 
     try {
-        // Process in source order so identical tags are persisted to matching slots.
-        for (let index = 0; index < tags.length; index++) {
-            await processTag(tags[index], index);
-        }
+        // Process all tags in parallel
+        await Promise.all(tags.map((tag, index) => processTag(tag, index)));
     } finally {
         processingMessages.delete(messageId);
         iigLog('INFO', `Finished processing message ${messageId}`);
     }
 
-    await context.saveChat();
+    await queueChatSave(context);
 
     if (typeof context.messageFormatting === 'function') {
         rerenderMessageHtml(context, message, settings, messageId, mesTextEl);
@@ -909,13 +787,39 @@ export async function processMessageTags(messageId) {
     }
 }
 
-// ----- Regenerate (user-triggered) -----
+// ----- Regenerate single tag (used by image action buttons) -----
 
-/**
- * Regenerate a single image identified by (messageId, tagIndex).
- * tagIndex matches the order of tags returned by parseMessageImageTags.
- */
-export async function regenerateSingleTag(messageId, tagIndex) {
+function findTagIndexByInstruction(tags, instructionValue) {
+    if (!instructionValue) return -1;
+
+    try {
+        const wanted = parseInstructionObject(instructionValue);
+        const fields = [
+            ['prompt', 'prompt'],
+            ['style', 'style'],
+            ['aspectRatio', 'aspect_ratio'],
+            ['imageSize', 'image_size'],
+            ['quality', 'quality'],
+            ['preset', 'preset'],
+        ];
+
+        return tags.findIndex((tag) => {
+            let compared = 0;
+            for (const [tagKey, instructionKey] of fields) {
+                const expected = wanted?.[instructionKey];
+                if (expected === undefined || expected === null || expected === '') continue;
+                compared++;
+                if (String(tag?.[tagKey] ?? '') !== String(expected)) return false;
+            }
+            return compared > 0;
+        });
+    } catch (error) {
+        iigLog('WARN', 'Could not parse clicked media instruction while locating its source tag:', error);
+        return -1;
+    }
+}
+
+export async function regenerateSingleTag(messageId, tagIndex, instructionValue = '') {
     const context = SillyTavern.getContext();
     const settings = getSettings();
     const message = context.chat[messageId];
@@ -926,21 +830,28 @@ export async function regenerateSingleTag(messageId, tagIndex) {
     }
 
     const tags = await parseMessageImageTags(message, { forceAll: true });
-    if (tagIndex < 0 || tagIndex >= tags.length) {
+    const domTagIndex = tagIndex;
+    const matchedTagIndex = findTagIndexByInstruction(tags, instructionValue);
+    const sourceTagIndex = matchedTagIndex >= 0 ? matchedTagIndex : domTagIndex;
+
+    if (sourceTagIndex < 0 || sourceTagIndex >= tags.length) {
         toastr.warning(t`Tag not found`, t`Image Generation`);
         return;
     }
 
-    if (processingMessages.has(messageId)) {
-        toastr.info(t`Message is already being processed`, t`Image Generation`);
+    const taskKey = singleTagTaskKey(messageId, domTagIndex);
+    if (activeSingleTagTasks.has(taskKey)) {
+        toastr.info(t`This image is already being processed`, t`Image Generation`);
         return;
     }
-    processingMessages.add(messageId);
+
+    activeSingleTagTasks.add(taskKey);
 
     const messageElement = document.querySelector(`#chat .mes[mesid="${messageId}"]`);
     const mesTextEl = messageElement?.querySelector('.mes_text');
+
     if (!mesTextEl) {
-        processingMessages.delete(messageId);
+        activeSingleTagTasks.delete(taskKey);
         return;
     }
 
@@ -949,43 +860,50 @@ export async function regenerateSingleTag(messageId, tagIndex) {
         rerenderMessageHtml(context, message, settings, messageId, mesTextEl);
     }
 
-    const tag = tags[tagIndex];
-    const tagId = `iig-regen-${messageId}-${tagIndex}`;
+    const tag = tags[sourceTagIndex];
+    const tagId = `iig-regen-${messageId}-${domTagIndex}`;
     applyConfiguredStyleToTag(tag, settings);
-
     let loadingPlaceholder = null;
-    const controller = new AbortController();
-    tagAbortControllers.set(tagId, controller);
+    let existingMedia = null;
+    let succeeded = false;
 
     try {
         const existingMediaList = Array.from(
             mesTextEl.querySelectorAll('img[data-iig-instruction], video[data-iig-instruction]')
         );
-        const existingMedia = existingMediaList[tagIndex] || null;
+        existingMedia = existingMediaList.find((media) => instructionValue
+            && decodeHtmlEntities(media.getAttribute('data-iig-instruction') || '') === decodeHtmlEntities(instructionValue))
+            || existingMediaList.find((media) => Number.parseInt(media.dataset.iigTagIndex || '', 10) === domTagIndex)
+            || existingMediaList[domTagIndex]
+            || existingMediaList[sourceTagIndex]
+            || null;
+
         if (!existingMedia) {
-            throw new Error(`Media element at index ${tagIndex} not found in DOM`);
+            throw new Error(`Media element at index ${domTagIndex} not found in DOM`);
         }
+
         const instruction = existingMedia.getAttribute('data-iig-instruction');
 
         loadingPlaceholder = createLoadingPlaceholder(tagId);
         existingMedia.replaceWith(loadingPlaceholder);
-        const statusEl = loadingPlaceholder.querySelector('.iig-status');
+
+        const statusEl = loadingPlaceholder.querySelector('.iig-status-label')
+            || loadingPlaceholder.querySelector('.iig-status');
 
         const generated = await generateImageWithRetry(
             tag.prompt,
             tag.style,
             (status) => { statusEl.textContent = status; },
-            { aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality, preset: tag.preset, messageId, signal: controller.signal }
+            { aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality, preset: tag.preset, messageId, signal: getLoadingSignal(loadingPlaceholder) }
         );
-
+        finishLoadingGeneration(loadingPlaceholder);
+        clearLoadingPlaceholderTimer(loadingPlaceholder);
         const { persistedSrc, persistedPosterSrc } = await persistGeneratedMedia(
             generated,
             statusEl,
-            { messageId, tagIndex, mode: 'regenerate' }
+            { messageId, tagIndex: sourceTagIndex, mode: 'regenerate' }
         );
-        if (!isGeneratedVideoResult(generated)) {
-            recordCharacterGeneration(persistedSrc, tag.prompt, settings);
-        }
+        if (!isGeneratedVideoResult(generated)) recordCharacterGeneration(persistedSrc, tag.prompt, getSettings());
 
         const mediaElement = createGeneratedMediaElement(
             isGeneratedVideoResult(generated)
@@ -993,45 +911,37 @@ export async function regenerateSingleTag(messageId, tagIndex) {
                 : persistedSrc,
             tag,
         );
+
         if (instruction) {
             mediaElement.setAttribute('data-iig-instruction', instruction);
         }
+        mediaElement.dataset.iigTagIndex = String(domTagIndex);
+
         loadingPlaceholder.replaceWith(mediaElement);
 
         const updatedTag = buildPersistedMediaTag(tag, generated, persistedSrc, persistedPosterSrc);
         replaceTagInMessageSource(message, tag, updatedTag);
+        succeeded = true;
 
-        const readyMsg = isGeneratedVideoResult(generated)
-            ? t`Video ready`
-            : t`Image ready`;
+        const readyMsg = isGeneratedVideoResult(generated) ? t`Video ready` : t`Image ready`;
         toastr.success(readyMsg, t`Image Generation`, { timeOut: 2000 });
     } catch (error) {
-        const wasAborted = error instanceof ProviderError && error.code === 'aborted';
-        if (wasAborted) {
-            iigLog('INFO', `Single-tag regeneration stopped by user for tag ${tagIndex}`);
-            if (loadingPlaceholder) {
-                const stoppedPlaceholder = createStoppedPlaceholder(tagId, tag);
-                loadingPlaceholder.replaceWith(stoppedPlaceholder);
-            }
-            if (tag.isNewFormat) {
-                const stoppedTag = buildPersistedImageTag(tag, STOPPED_IMAGE_PATH);
-                replaceTagInMessageSource(message, tag, stoppedTag);
-            } else {
-                replaceTagInMessageSource(message, tag, `[IMG:STOPPED]`);
-            }
-            toastr.info(t`Generation stopped`, t`Image Generation`, { timeOut: 2000 });
-        } else {
-            iigLog('ERROR', `Single-tag regeneration failed for tag ${tagIndex}:`, error);
+        clearLoadingPlaceholderTimer(loadingPlaceholder);
+        if (loadingPlaceholder?.isConnected && existingMedia) loadingPlaceholder.replaceWith(existingMedia);
+        const cancelled = isGenerationCancelled(error, getLoadingSignal(loadingPlaceholder));
+        iigLog(cancelled ? 'INFO' : 'ERROR', `Single-tag regeneration ${cancelled ? 'cancelled' : 'failed'} for tag ${sourceTagIndex}:`, error);
+        if (cancelled) toastr.info(t`Generation was cancelled by the user.`, t`Generation cancelled`, { timeOut: 2500 });
+        else {
             const friendly = formatProviderError(error);
             toastr.error(friendly.message, friendly.title);
         }
     } finally {
-        tagAbortControllers.delete(tagId);
-        processingMessages.delete(messageId);
-        await context.saveChat();
-        rerenderMessageHtml(context, message, settings, messageId, mesTextEl);
+        activeSingleTagTasks.delete(taskKey);
+        if (succeeded) await queueChatSave(context);
     }
 }
+
+// ----- Regenerate all tags (user-triggered) -----
 
 export async function regenerateMessageImages(messageId) {
     const context = SillyTavern.getContext();
@@ -1043,86 +953,81 @@ export async function regenerateMessageImages(messageId) {
         return;
     }
 
-    if (processingMessages.has(messageId)) {
-        toastr.info(t`Message is already being processed`, t`Image Generation`);
+    const tags = await parseMessageImageTags(message, { forceAll: true });
+
+    if (tags.length === 0) {
+        toastr.warning(t`No tags to regenerate`, t`Image Generation`);
         return;
     }
 
+    iigLog('INFO', `Regenerating ${tags.length} images in message ${messageId}`);
+    toastr.info(t`Regenerating ${tags.length} images...`, t`Image Generation`);
+
     processingMessages.add(messageId);
 
+    const messageElement = document.querySelector(`#chat .mes[mesid="${messageId}"]`);
+    if (!messageElement) {
+        processingMessages.delete(messageId);
+        return;
+    }
+
+    const mesTextEl = messageElement.querySelector('.mes_text');
+    if (!mesTextEl) {
+        processingMessages.delete(messageId);
+        return;
+    }
+
+    const convertedLegacyTags = convertLegacyTagsToInstructionFormat(message, tags);
+    if (convertedLegacyTags > 0) {
+        rerenderMessageHtml(context, message, settings, messageId, mesTextEl);
+        iigLog('INFO', `Converted ${convertedLegacyTags} legacy tag(s) to instruction tags before regeneration`);
+    }
+
     try {
-        const tags = await parseMessageImageTags(message, { forceAll: true });
-
-        iigLog('INFO', `regenerateMessageImages(messageId=${messageId}): parser found ${tags.length} tag(s)`);
-        for (let i = 0; i < tags.length; i++) {
-            iigLog('INFO', `  tag[${i}] prompt: "${String(tags[i].prompt || '').substring(0, 60)}"`);
-        }
-
-        if (tags.length === 0) {
-            toastr.warning(t`No tags to regenerate`, t`Image Generation`);
-            return;
-        }
-
-        iigLog('INFO', `Regenerating ${tags.length} images in message ${messageId}`);
-        toastr.info(t`Regenerating ${tags.length} images...`, t`Image Generation`);
-
-        const messageElement = document.querySelector(`#chat .mes[mesid="${messageId}"]`);
-        if (!messageElement) {
-            iigLog('WARN', `regenerateMessageImages: .mes[mesid="${messageId}"] not found in DOM`);
-            return;
-        }
-
-        const mesTextEl = messageElement.querySelector('.mes_text');
-        if (!mesTextEl) {
-            iigLog('WARN', `regenerateMessageImages: .mes_text not found inside message ${messageId}`);
-            return;
-        }
-
-        const convertedLegacyTags = convertLegacyTagsToInstructionFormat(message, tags);
-        if (convertedLegacyTags > 0) {
-            rerenderMessageHtml(context, message, settings, messageId, mesTextEl);
-            iigLog('INFO', `Converted ${convertedLegacyTags} legacy tag(s) to instruction tags before regeneration`);
-        }
-
         for (let index = 0; index < tags.length; index++) {
             const tag = tags[index];
             const tagId = `iig-regen-${messageId}-${index}`;
+            const taskKey = singleTagTaskKey(messageId, index);
+            if (activeSingleTagTasks.has(taskKey)) {
+                iigLog('INFO', `Skipping tag ${index}: it is already being generated`);
+                continue;
+            }
+            activeSingleTagTasks.add(taskKey);
             applyConfiguredStyleToTag(tag, settings);
-            iigLog('INFO', `regen iter[${index}/${tags.length - 1}] start: prompt="${String(tag.prompt || '').substring(0, 40)}"`);
-
-            let loadingPlaceholder = null;
-            const controller = new AbortController();
-            tagAbortControllers.set(tagId, controller);
 
             try {
+                // Find the existing rendered media element with data-iig-instruction
                 const existingMediaList = Array.from(
                     mesTextEl.querySelectorAll('img[data-iig-instruction], video[data-iig-instruction]')
                 );
-                const existingMedia = existingMediaList[index] || existingMediaList[0] || null;
-                iigLog('INFO', `regen iter[${index}] DOM media count=${existingMediaList.length}, picked=${existingMedia ? (existingMediaList[index] === existingMedia ? `[${index}]` : '[0]-fallback') : 'NONE'}`);
+                const existingMedia = existingMediaList.find((media) => Number.parseInt(media.dataset.iigTagIndex || '', 10) === index)
+                    || existingMediaList[index]
+                    || existingMediaList[0]
+                    || null;
                 if (existingMedia) {
+                    // Preserve the instruction for future regenerations
                     const instruction = existingMedia.getAttribute('data-iig-instruction');
 
-                    loadingPlaceholder = createLoadingPlaceholder(tagId);
+                    const loadingPlaceholder = createLoadingPlaceholder(tagId);
                     existingMedia.replaceWith(loadingPlaceholder);
 
-                    const statusEl = loadingPlaceholder.querySelector('.iig-status');
+                    const statusEl = loadingPlaceholder.querySelector('.iig-status-label')
+                        || loadingPlaceholder.querySelector('.iig-status');
 
                     const generated = await generateImageWithRetry(
                         tag.prompt,
                         tag.style,
                         (status) => { statusEl.textContent = status; },
-                        { aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality, preset: tag.preset, messageId, signal: controller.signal }
+                        { aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality, preset: tag.preset, messageId, signal: getLoadingSignal(loadingPlaceholder) }
                     );
-
+                    finishLoadingGeneration(loadingPlaceholder);
+                    clearLoadingPlaceholderTimer(loadingPlaceholder);
                     const { persistedSrc, persistedPosterSrc } = await persistGeneratedMedia(
                         generated,
                         statusEl,
                         { messageId, tagIndex: index, mode: 'regenerate' }
                     );
-                    if (!isGeneratedVideoResult(generated)) {
-                        recordCharacterGeneration(persistedSrc, tag.prompt, settings);
-                    }
+                    if (!isGeneratedVideoResult(generated)) recordCharacterGeneration(persistedSrc, tag.prompt, getSettings());
 
                     const mediaElement = createGeneratedMediaElement(
                         isGeneratedVideoResult(generated)
@@ -1133,6 +1038,7 @@ export async function regenerateMessageImages(messageId) {
                     if (instruction) {
                         mediaElement.setAttribute('data-iig-instruction', instruction);
                     }
+                    mediaElement.dataset.iigTagIndex = String(index);
                     loadingPlaceholder.replaceWith(mediaElement);
 
                     const updatedTag = buildPersistedMediaTag(tag, generated, persistedSrc, persistedPosterSrc);
@@ -1142,39 +1048,27 @@ export async function regenerateMessageImages(messageId) {
                         ? t`Video ${index + 1}/${tags.length} ready`
                         : t`Image ${index + 1}/${tags.length} ready`;
                     toastr.success(readyMsg, t`Image Generation`, { timeOut: 2000 });
-                    iigLog('INFO', `regen iter[${index}] complete`);
-                } else {
-                    iigLog('WARN', `regen iter[${index}] skipped: no DOM element found`);
                 }
             } catch (error) {
-                const wasAborted = error instanceof ProviderError && error.code === 'aborted';
-                if (wasAborted) {
-                    iigLog('INFO', `regen iter[${index}] stopped by user`);
-                    if (loadingPlaceholder) {
-                        const stoppedPlaceholder = createStoppedPlaceholder(tagId, tag);
-                        loadingPlaceholder.replaceWith(stoppedPlaceholder);
-                    }
-                    if (tag.isNewFormat) {
-                        const stoppedTag = buildPersistedImageTag(tag, STOPPED_IMAGE_PATH);
-                        replaceTagInMessageSource(message, tag, stoppedTag);
-                    } else {
-                        replaceTagInMessageSource(message, tag, `[IMG:STOPPED]`);
-                    }
-                    toastr.info(t`Generation stopped`, t`Image Generation`, { timeOut: 2000 });
+                const activePlaceholder = mesTextEl.querySelector(`[data-tag-id="${tagId}"]`);
+                clearLoadingPlaceholderTimer(activePlaceholder);
+                const cancelled = isGenerationCancelled(error, getLoadingSignal(activePlaceholder));
+                iigLog(cancelled ? 'INFO' : 'ERROR', `Regeneration ${cancelled ? 'cancelled' : 'failed'} for tag ${index}:`, error.message);
+                if (cancelled) {
+                    toastr.info(t`Generation was cancelled by the user.`, t`Generation cancelled`, { timeOut: 2500 });
+                    break;
                 } else {
-                    iigLog('ERROR', `Regeneration failed for tag ${index}:`, error);
                     const friendly = formatProviderError(error);
                     toastr.error(friendly.message, friendly.title);
                 }
             } finally {
-                tagAbortControllers.delete(tagId);
+                activeSingleTagTasks.delete(taskKey);
             }
         }
-
-        await context.saveChat();
-        rerenderMessageHtml(context, message, settings, messageId, mesTextEl);
-        iigLog('INFO', `Regeneration complete for message ${messageId}`);
     } finally {
         processingMessages.delete(messageId);
+        await queueChatSave(context);
+        rerenderMessageHtml(context, message, settings, messageId, mesTextEl);
+        iigLog('INFO', `Regeneration complete for message ${messageId}`);
     }
 }

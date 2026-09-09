@@ -1,12 +1,12 @@
 {
-    "display_name": "Inline Image Generation",
+    "display_name": "Nya-Imagen",
     "loading_order": 100,
     "requires": [],
     "optional": [],
     "js": "index.js",
     "css": "style.css",
-    "author": "local & astera",
-    "version": "2.0",
+    "author": "",
+    "version": "1.726",
     "homePage": "https://github.com/0xl0cal/sillyimages/",
     "auto_update": true,
     "i18n": {

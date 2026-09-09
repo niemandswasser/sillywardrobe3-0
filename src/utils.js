@@ -245,7 +245,7 @@ export async function saveImageToFile(dataUrl, debugMeta = {}) {
 
     const result = await response.json();
     console.log('[IIG] Image saved to:', result.path);
-    return encodeLocalMediaPath(result.path);
+    return result.path;
 }
 
 export async function saveNaisteraMediaToFile(dataUrl, mediaKind = 'video', debugMeta = {}) {
@@ -284,43 +284,10 @@ export async function saveNaisteraMediaToFile(dataUrl, mediaKind = 'video', debu
     if (!result?.path) {
         throw new Error('No path in media upload response');
     }
-    return encodeLocalMediaPath(result.path);
+    return result.path;
 }
 
 // ----- Small helpers -----
-
-// Accept raw server filesystem paths only; stored URLs are already encoded.
-export function encodeLocalMediaPath(path) {
-    if (typeof path !== 'string' || !path) throw new Error('No path in media upload response');
-    const encoded = path.split('/').map(encodeURIComponent).join('/');
-    return encoded.startsWith('/') ? encoded : `/${encoded}`;
-}
-
-export async function listCharacterGenerationPaths(characterName) {
-    const context = SillyTavern.getContext();
-    const sanitizedResponse = await fetch('/api/files/sanitize-filename', {
-        method: 'POST',
-        headers: context.getRequestHeaders(),
-        body: JSON.stringify({ fileName: characterName }),
-    });
-    if (!sanitizedResponse.ok) {
-        throw new Error((await sanitizedResponse.text()) || `HTTP ${sanitizedResponse.status}`);
-    }
-    const { fileName: folder } = await sanitizedResponse.json();
-    if (typeof folder !== 'string' || !folder) throw new Error('Character image folder is empty');
-    const response = await fetch('/api/images/list', {
-        method: 'POST',
-        headers: context.getRequestHeaders(),
-        body: JSON.stringify({ folder, sortField: 'date', sortOrder: 'desc' }),
-    });
-    if (!response.ok) {
-        throw new Error((await response.text()) || `HTTP ${response.status}`);
-    }
-    const files = await response.json();
-    return (Array.isArray(files) ? files : [])
-        .filter((file) => typeof file === 'string' && /^iig_/i.test(file))
-        .map((file) => `/user/images/${encodeURIComponent(folder)}/${encodeURIComponent(file)}`);
-}
 
 export async function checkFileExists(path) {
     try {
@@ -346,9 +313,7 @@ export function escapeRegex(text) {
 export function sanitizeForHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
-    return div.innerHTML
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#39;');
+    return div.innerHTML;
 }
 
 export function sanitizeForSingleQuotedAttribute(text) {
@@ -357,6 +322,73 @@ export function sanitizeForSingleQuotedAttribute(text) {
         .replace(/'/g, '&#39;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;');
+}
+
+// ----- Generated image helpers (shared by lightbox / gallery / imageActions / pipeline) -----
+
+/** Декодирует HTML-сущности, которыми экранирован атрибут data-iig-instruction. */
+export function decodeHtmlEntities(text) {
+    return String(text || '')
+        .replace(/&quot;/g, '"')
+        .replace(/&apos;/g, "'")
+        .replace(/&#39;/g, "'")
+        .replace(/&#34;/g, '"')
+        .replace(/&amp;/g, '&');
+}
+
+/**
+ * Парсит JSON из атрибута data-iig-instruction.
+ * @param {string|null} instruction — сырое значение атрибута.
+ * @returns {object|null} объект инструкции или null (пустой/битый атрибут).
+ */
+export function parseInstructionAttr(instruction) {
+    if (!instruction) return null;
+    try {
+        const parsed = JSON.parse(decodeHtmlEntities(instruction));
+        return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch {
+        return null;
+    }
+}
+
+/** Определяет расширение файла картинки по src (data URL или обычный путь). */
+export function guessImageExtension(src) {
+    if (src.startsWith('data:')) {
+        const m = src.match(/^data:image\/([a-z0-9+]+)/i);
+        if (m) return m[1].replace('jpeg', 'jpg');
+    }
+    const m = src.match(/\.([a-z0-9]+)(?:\?|#|$)/i);
+    if (m) return m[1].toLowerCase();
+    return 'png';
+}
+
+/**
+ * Скачивает картинку по src через временный <a download>;
+ * не-data URL предварительно тянется в Blob (иначе браузер откроет вкладку).
+ * @returns {Promise<boolean>} false, если скачивание не удалось.
+ */
+export async function downloadImageSrc(src, filename = null) {
+    let url = src;
+    let cleanup = null;
+    if (!src.startsWith('data:')) {
+        try {
+            const resp = await fetch(src);
+            const blob = await resp.blob();
+            url = URL.createObjectURL(blob);
+            cleanup = () => URL.revokeObjectURL(url);
+        } catch (err) {
+            iigLog('ERROR', 'Image download failed:', err);
+            return false;
+        }
+    }
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename || `iig_${Date.now()}.${guessImageExtension(src)}`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    if (cleanup) setTimeout(cleanup, 100);
+    return true;
 }
 
 // ----- Binary helpers -----
@@ -389,7 +421,7 @@ export function dataUrlToBlob(dataUrl) {
  * @param {string | URL} url
  * @param {RequestInit} init
  * @param {number} timeoutMs — по умолчанию 600 000 (10 минут). Некоторые
- *   image-модели (HQ image providers, flux-kontext на бесплатных прокси,
+ *   image-модели (gpt-image-2 HQ, flux-kontext на бесплатных прокси,
  *   медленные Gemini инстансы) спокойно работают 3-5 минут. Меньший
  *   таймаут давал ложные fail'ы.
  */
@@ -412,34 +444,9 @@ export async function fetchWithTimeout(url, init = {}, timeoutMs = 600_000, exte
     }
 }
 
-/**
- * Promise-based delay that resolves early when `signal` aborts. Removes its
- * abort listener on the normal timeout path, so it is safe to call repeatedly
- * (e.g. inside a polling loop) without accumulating listeners.
- */
-export function abortableDelay(ms, signal = null) {
-    return new Promise((resolve) => {
-        if (signal?.aborted) {
-            resolve();
-            return;
-        }
-        let timer = null;
-        const onAbort = () => {
-            clearTimeout(timer);
-            resolve();
-        };
-        timer = setTimeout(() => {
-            signal?.removeEventListener('abort', onAbort);
-            resolve();
-        }, ms);
-        signal?.addEventListener('abort', onAbort, { once: true });
-    });
-}
-
 // ----- Error / UI asset paths -----
 
 export const ERROR_IMAGE_PATH = '/scripts/extensions/third-party/sillyimages/error.svg';
-export const STOPPED_IMAGE_PATH = '/scripts/extensions/third-party/sillyimages/stopped.svg';
 
 // ----- Provider error -----
 
