@@ -1,4 +1,4 @@
-import { getSettings, saveSettings } from './settings.js';
+import { cleanupObsoleteEmbeddedMedia, getSettings, saveSettings } from './settings.js';
 import {
     addCharacterLibraryAppearanceItem,
     createCustomCharacterLibraryProfile,
@@ -73,7 +73,11 @@ async function migrateLegacyAvatarLibrary(settings = getSettings()) {
             ? settings.legacyAvatarLibraryMigratedIds.map(String)
             : []);
         const pending = legacyItems.filter(item => item?.id && item?.imageData && !migrated.has(String(item.id)));
-        if (!pending.length) return 0;
+        if (!pending.length) {
+            const cleanup = cleanupObsoleteEmbeddedMedia(settings);
+            if (cleanup.changed) saveSettings();
+            return 0;
+        }
 
         const charKey = getCurrentCharacterReferenceKey();
         const userKey = await getCurrentUserReferenceKey(settings);
@@ -113,7 +117,12 @@ async function migrateLegacyAvatarLibrary(settings = getSettings()) {
         if (done) {
             if (migratedKinds.has('char')) settings.activeAvatarChar = null;
             if (migratedKinds.has('user')) settings.activeAvatarUser = null;
+        }
+        const cleanup = cleanupObsoleteEmbeddedMedia(settings);
+        if (done || cleanup.changed) {
             saveSettings();
+        }
+        if (done) {
             toastr.success(t`Old avatars moved to the character library: ${done}`, t`Image Generation`);
         }
         return done;

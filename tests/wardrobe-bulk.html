@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="ru">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../style.css">
+<style>body { margin: 0; background: #222; color: #eee; } .text_pole { background: #333; color: #eee; border: 1px solid #666; } #result { position: fixed; bottom: 0; font-size: 9px; }</style>
+<dialog id="sw-maint-overlay"><div id="sw-maint-panel">
+<div class="sw-cleanup-header">Обслуживание гардероба</div>
+<div class="sw-maint-tabs"><div class="sw-maint-tab">Дубликаты</div><div class="sw-maint-tab">Распределение</div><div class="sw-maint-tab">Удаление нарядов</div><div class="sw-maint-tab">Чистка файлов</div></div>
+<div class="sw-cleanup-body sw-bulk-body" id="sw-maint-body"></div>
+</div></dialog>
+<pre id="result">RUNNING</pre>
+<script type="module">
+import { renderWardrobeBulkCleanup } from '../src/wardrobeBulkUi.js';
+const check = (condition, message) => { if (!condition) throw new Error(message); };
+const image = 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="100" height="160"><rect width="100" height="160" fill="#556655"/></svg>');
+try {
+    const makeOutfit = n => ({ id: 'e' + n, name: 'Наряд ' + n, type: n % 2 ? 'casual' : 'formal', addedAt: n, imagePath: image });
+    const settings = { wardrobes: { Ethan: { bot: Array.from({ length: 14 }, (_, i) => makeOutfit(i + 1)), user: [] },
+        Other: { bot: [makeOutfit(1)], user: [] } },
+        activeOutfits: { Ethan: { bot: 'e14' }, Other: { bot: 'e1' } },
+        personaWardrobes: { 'persona:z.png': [makeOutfit(1)] }, personaActiveOutfits: {},
+        sharedBotWardrobe: [], sharedUserWardrobe: [], sharedDeletedSourceIds: { bot: [], user: [] } };
+    for (let n = 0; n < 200; n++) settings.wardrobes['Bot ' + n] = { bot: [makeOutfit(n + 1)], user: [] };
+    const panel = document.getElementById('sw-maint-panel');
+    const body = document.getElementById('sw-maint-body');
+    const q = selector => body.querySelector(selector);
+    let allowDelete = false, confirmations = [], saves = 0;
+    const types = [{ id: 'casual', label: 'Повседневное' }, { id: 'formal', label: 'Формальное' }, { id: 'other', label: 'Другое' }];
+    document.getElementById('sw-maint-overlay').showModal();
+    renderWardrobeBulkCleanup(body, { getSettings: () => settings,
+        getMetadata: () => ({ personas: { 'z.png': 'Zach' } }), getTypes: () => types,
+        imageSrc: outfit => outfit.imagePath, onChange: () => { saves++; },
+        confirm: message => { confirmations.push(message); return allowDelete; } });
+    const change = (selector, value, event = 'change') => {
+        const input = q(selector); input.value = value; input.dispatchEvent(new Event(event, { bubbles: true }));
+    };
+    check(body.querySelectorAll('[data-bulk-entry]').length === 6, 'render only one page, not all 200+ images');
+    change('[data-bulk-kind]', 'bot');
+    check(![...q('[data-bulk-owner]').options].some(option => option.value === 'persona:z.png'), 'bot filter excludes personas');
+    change('[data-bulk-owner]', 'character:Ethan');
+    check(body.querySelectorAll('[data-bulk-entry]').length === 6, 'six outfits per page');
+    check(q('.sw-bulk-protected')?.disabled, 'equipped outfit protected');
+    q('[data-bulk-page-all]').click();
+    check(q('[data-bulk-delete]').textContent.includes('(5)'), 'page selection excludes equipped outfit');
+    q('[data-bulk-page="1"]').click();
+    q('[data-bulk-page-all]').click();
+    check(q('[data-bulk-delete]').textContent.includes('(11)'), 'selection persists across pages');
+    q('[data-bulk-page="0"]').click();
+    check(body.querySelectorAll('.sw-bulk-selected').length === 5, 'previous-page selection retained');
+    change('[data-bulk-search]', 'Наряд 14', 'input');
+    check(q('[data-bulk-delete]').disabled, 'filter change clears selection');
+    check(body.querySelectorAll('[data-bulk-entry]').length === 1, 'search filters entries');
+    change('[data-bulk-search]', '', 'input');
+    change('[data-bulk-category]', 'casual');
+    q('[data-bulk-all]').click();
+    check(q('[data-bulk-delete]').textContent.includes('(7)'), 'select all filtered, not other categories');
+    q('[data-bulk-delete]').click();
+    check(settings.wardrobes.Ethan.bot.length === 14 && saves === 0, 'cancelling confirmation is read-only');
+    allowDelete = true;
+    q('[data-bulk-delete]').click();
+    check(settings.wardrobes.Ethan.bot.length === 7 && saves === 1, 'batch removal saves once');
+    check(settings.wardrobes.Ethan.bot.every(outfit => outfit.type === 'formal'), 'only filtered category deleted');
+    check(settings.wardrobes.Other.bot.length === 1, 'same ID in another wardrobe preserved');
+    check(!q('[data-bulk-undo]').disabled, 'undo enabled');
+    q('[data-bulk-undo]').click();
+    check(settings.wardrobes.Ethan.bot.length === 14 && saves === 2, 'undo restores all removed records');
+    change('[data-bulk-category]', '');
+    const protect = q('[data-bulk-protect]'); protect.checked = false; protect.dispatchEvent(new Event('change'));
+    q('[data-bulk-all]').click(); q('[data-bulk-delete]').click();
+    check(confirmations.at(-1).includes('надетых нарядов — 1'), 'confirm warns about equipped outfits');
+    check(settings.activeOutfits.Ethan.bot === null, 'equipped pointer cleared');
+    check(settings.wardrobes.Ethan.bot.length === 0, 'whole owner deleted');
+    check(q('[data-bulk-owner]').value === 'character:Ethan', 'empty owner stays selected; do not jump to all wardrobes');
+    check(!body.querySelector('[data-bulk-entry]'), 'empty owner shows no unrelated outfits');
+    q('[data-bulk-undo]').click();
+    check(settings.wardrobes.Ethan.bot.length === 14 && settings.activeOutfits.Ethan.bot === 'e14', 'undo restores equipped owner');
+    const before = panel.getBoundingClientRect();
+    q('.sw-bulk-scroll').scrollTop = 10000;
+    const after = panel.getBoundingClientRect();
+    check(before.top === after.top && before.height === after.height, 'scroll must not move or resize the dialog');
+    const footer = q('.sw-bulk-footer').getBoundingClientRect();
+    check(footer.top >= 0 && footer.bottom <= innerHeight, `actions stay on screen (${innerWidth}x${innerHeight}, footer bottom ${footer.bottom})`);
+    check(body.scrollHeight <= body.clientHeight + 1, 'only the card area should scroll');
+    check(panel.scrollWidth <= panel.clientWidth + 1, 'no horizontal overflow');
+    document.getElementById('result').textContent = 'PASS: filters, six-item pages, cross-page selection, protection, confirm, scoped deletion, undo, stable scrolling and visible actions';
+} catch (error) { document.getElementById('result').textContent = 'FAIL: ' + error.stack; }
+</script>
+</html>

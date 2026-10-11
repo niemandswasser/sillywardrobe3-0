@@ -66,6 +66,15 @@ export function exportLogs() {
 export const defaultSettings = Object.freeze({
     enabled: true,
     externalBlocks: false,
+    extBlocksProfileRoutingEnabled: false,
+    extBlocksProfileBindings: {
+        big: '',
+        medium: '',
+        small: '',
+    },
+    censorOnGenerate: false,
+    prettyErrorImages: false,
+    imageActionPosition: 'top-right',
     imageContextEnabled: false,
     imageContextCount: 1,
     styles: [],
@@ -75,7 +84,7 @@ export const defaultSettings = Object.freeze({
     suffixes: [],
     activeSuffixId: '',
     styleTags: ['GPT', 'Nano Banana', 'NovelAI', 'character', 'girl', 'boy', 'lighting'],
-    apiType: 'openai', // 'openai' | 'gemini' | 'openrouter' | 'electronhub' | 'naistera' | 'void' | 'aigate' | 'novelai'
+    apiType: 'openai', // 'openai' | 'gemini' | 'openrouter' | 'electronhub' | 'naistera' | 'void' | 'novelai'
     endpoint: '',
     /**
      * Если true — endpoint используется «как есть» для генерации (никаких
@@ -117,9 +126,10 @@ export const defaultSettings = Object.freeze({
     novelaiModel: 'nai-diffusion-4-5-full',
     novelaiCustomModel: '',
     novelaiSampler: 'k_euler_ancestral',
-    novelaiScheduler: 'karras',
+    novelaiScheduler: 'native',
     novelaiSteps: 28,
     novelaiScale: 5,
+    novelaiCfgRescale: 0,
     novelaiSize: 'Portrait',
     novelaiNegativePrompt: DEFAULT_NOVELAI_NEGATIVE_PROMPT,
     novelaiNegativePresets: [{
@@ -260,6 +270,7 @@ export const CONNECTION_FIELDS = Object.freeze([
     'novelaiScheduler',
     'novelaiSteps',
     'novelaiScale',
+    'novelaiCfgRescale',
     'novelaiSize',
     'novelaiNegativePrompt',
     'novelaiAnlasGuard',
@@ -273,26 +284,30 @@ export const CONNECTION_FIELDS = Object.freeze([
     'novelaiReferenceFidelity',
 ]);
 
-const REMOVED_PROBLEMBO_FIELDS = Object.freeze([
+const REMOVED_PROVIDER_IDS = new Set(['problembo', 'wellflow', 'aigate']);
+const REMOVED_PROVIDER_FIELDS = Object.freeze([
     'problemboNegativePrompt',
     'problemboStyle',
     'problemboSeed',
     'problemboAspectRatio',
     'problemboResolution',
     'problemboEnableReferences',
+    'wellflowSize',
+    'wellflowUseProxy',
 ]);
 
-/** Удаляет настройки и профили снятого с поддержки провайдера Problembo. */
+// Remove retired provider connections without touching wardrobe or reference data.
 export function migrateRemovedProviders(settings = getSettings()) {
     let changed = false;
     const profiles = Array.isArray(settings.connectionProfiles) ? settings.connectionProfiles : [];
-    const remainingProfiles = profiles.filter(profile => profile?.apiType !== 'problembo');
+    const removedIds = new Set(profiles.filter(profile => REMOVED_PROVIDER_IDS.has(profile?.apiType)).map(profile => profile.id));
+    const remainingProfiles = profiles.filter(profile => !REMOVED_PROVIDER_IDS.has(profile?.apiType));
     if (remainingProfiles.length !== profiles.length) {
         settings.connectionProfiles = remainingProfiles;
         changed = true;
     }
 
-    if (settings.apiType === 'problembo') {
+    if (REMOVED_PROVIDER_IDS.has(settings.apiType)) {
         const fallback = remainingProfiles.find(profile => profile.id === settings.activeConnectionProfileId)
             || remainingProfiles[0]
             || null;
@@ -309,17 +324,30 @@ export function migrateRemovedProviders(settings = getSettings()) {
         }
         changed = true;
     } else if (!remainingProfiles.some(profile => profile.id === settings.activeConnectionProfileId)) {
-        settings.activeConnectionProfileId = remainingProfiles[0]?.id || '';
+        const nextId = remainingProfiles[0]?.id || '';
+        if (settings.activeConnectionProfileId !== nextId) changed = true;
+        settings.activeConnectionProfileId = nextId;
     }
 
-    for (const field of REMOVED_PROBLEMBO_FIELDS) {
+    for (const field of REMOVED_PROVIDER_FIELDS) {
         if (Object.hasOwn(settings, field)) {
             delete settings[field];
             changed = true;
         }
-        for (const profile of remainingProfiles) delete profile[field];
+        for (const profile of remainingProfiles) {
+            if (Object.hasOwn(profile, field)) {
+                delete profile[field];
+                changed = true;
+            }
+        }
     }
-    if (changed) iigLog('INFO', 'Removed obsolete Problembo provider settings and profiles');
+    for (const preset of ['big', 'medium', 'small']) {
+        if (removedIds.has(settings.extBlocksProfileBindings?.[preset])) {
+            settings.extBlocksProfileBindings[preset] = '';
+            changed = true;
+        }
+    }
+    if (changed) iigLog('INFO', 'Cleaned up retired provider connections');
     return changed;
 }
 
@@ -372,7 +400,7 @@ export function getActiveConnectionProfile(settings = getSettings()) {
 export function migrateConnectionProfilesFromLegacy(settings = getSettings()) {
     ensureConnectionProfiles(settings);
     if (settings.connectionProfiles.length > 0) {
-        return;
+        return false;
     }
     const id = makeProfileId();
     settings.connectionProfiles.push({
@@ -381,6 +409,25 @@ export function migrateConnectionProfilesFromLegacy(settings = getSettings()) {
         ...extractConnectionFields(settings),
     });
     settings.activeConnectionProfileId = id;
+    return true;
+}
+
+/**
+ * Returns a non-mutating settings view with connection fields taken from the
+ * requested profile. It is used for one-off routed generations (for example,
+ * an ExtBlocks preset) without switching the profile selected in the UI.
+ */
+export function buildConnectionProfileSettings(profileId, settings = getSettings()) {
+    const targetId = String(profileId || '').trim();
+    if (!targetId) return settings;
+    const profile = ensureConnectionProfiles(settings).find(item => item.id === targetId);
+    if (!profile) return settings;
+    return {
+        ...settings,
+        ...profile,
+        connectionProfiles: settings.connectionProfiles,
+        activeConnectionProfileId: profile.id,
+    };
 }
 
 /**
@@ -447,6 +494,13 @@ export function removeConnectionProfile(profileId, settings = getSettings()) {
     if (settings.activeConnectionProfileId === profileId) {
         settings.activeConnectionProfileId = profiles[0]?.id || '';
     }
+    if (settings.extBlocksProfileBindings && typeof settings.extBlocksProfileBindings === 'object') {
+        for (const preset of ['big', 'medium', 'small']) {
+            if (settings.extBlocksProfileBindings[preset] === profileId) {
+                settings.extBlocksProfileBindings[preset] = '';
+            }
+        }
+    }
     return true;
 }
 
@@ -476,6 +530,7 @@ export const NAISTERA_MODELS = Object.freeze([
 ]);
 export const NOVELAI_MODELS = Object.freeze([
     { value: 'nai-diffusion-5-full', text: 'NAI Diffusion V5 (Full)' },
+    { value: 'nai-diffusion-5-full-medium', text: 'NAI Diffusion V5 (Full Medium)' },
     { value: 'nai-diffusion-5-curated', text: 'NAI Diffusion V5 (Curated)' },
     { value: 'nai-diffusion-4-5-full', text: 'NAI Diffusion V4.5 (Full)' },
     { value: 'nai-diffusion-4-5-curated', text: 'NAI Diffusion V4.5 (Curated)' },
@@ -510,7 +565,6 @@ export const DEFAULT_ENDPOINTS = Object.freeze({
     openrouter: 'https://openrouter.ai/api/v1',
     electronhub: 'https://api.electronhub.ai',
     void: 'https://api.voidai.app',
-    aigate: 'https://api.aigate.shop',
 });
 
 export const ENDPOINT_PLACEHOLDERS = Object.freeze({
@@ -520,7 +574,6 @@ export const ENDPOINT_PLACEHOLDERS = Object.freeze({
     electronhub: 'https://api.electronhub.ai',
     naistera: 'https://naistera.org',
     void: 'https://api.voidai.app',
-    aigate: 'https://api.aigate.shop',
 });
 
 // ----- Settings accessors -----
@@ -556,14 +609,87 @@ export function getSettings() {
         }
     }
 
-    migrateNovelaiPresetsFormat(context.extensionSettings[MODULE_NAME]);
+    const settings = context.extensionSettings[MODULE_NAME];
+    const rawExtBlocksBindings = settings.extBlocksProfileBindings;
+    settings.extBlocksProfileBindings = {
+        big: String(rawExtBlocksBindings?.big || ''),
+        medium: String(rawExtBlocksBindings?.medium || ''),
+        small: String(rawExtBlocksBindings?.small || ''),
+    };
 
-    return context.extensionSettings[MODULE_NAME];
+    migrateNovelaiPresetsFormat(settings);
+
+    return settings;
 }
-
 export function saveSettings() {
     const context = SillyTavern.getContext();
     context.saveSettingsDebounced();
+}
+
+/**
+ * Removes obsolete embedded image copies that are no longer consumed by the
+ * current character library / wardrobe implementation. Old avatar data is
+ * cleared only after every image-bearing entry is confirmed as migrated and
+ * no legacy avatar is still selected. An interrupted or partial migration
+ * therefore leaves the source data untouched.
+ */
+export function cleanupObsoleteEmbeddedMedia(settings = getSettings()) {
+    const report = {
+        changed: false,
+        avatars: 0,
+        wardrobe: 0,
+        hairstyles: 0,
+        avatarsDeferred: false,
+    };
+
+    const legacyAvatars = Array.isArray(settings.avatarItems) ? settings.avatarItems : [];
+    if (legacyAvatars.length > 0) {
+        const migratedIds = new Set(
+            (Array.isArray(settings.legacyAvatarLibraryMigratedIds)
+                ? settings.legacyAvatarLibraryMigratedIds
+                : [])
+                .map(id => String(id || '').trim())
+                .filter(Boolean),
+        );
+        const imageEntries = legacyAvatars.filter(item => String(item?.imageData || '').trim());
+        const allImagesMigrated = imageEntries.every(item => {
+            const id = String(item?.id || '').trim();
+            return Boolean(id) && migratedIds.has(id);
+        });
+        const legacySelectionInactive = !settings.activeAvatarChar && !settings.activeAvatarUser;
+
+        if (allImagesMigrated && legacySelectionInactive) {
+            report.avatars = legacyAvatars.length;
+            settings.avatarItems = [];
+            report.changed = true;
+        } else {
+            report.avatarsDeferred = true;
+        }
+    }
+
+    // These arrays belonged to superseded UI implementations. The live
+    // wardrobe is stored under extension_settings.silly_wardrobe instead.
+    if (Array.isArray(settings.swItems) && settings.swItems.length > 0) {
+        report.wardrobe = settings.swItems.length;
+        settings.swItems = [];
+        report.changed = true;
+    }
+    if (Array.isArray(settings.hairstyleItems) && settings.hairstyleItems.length > 0) {
+        report.hairstyles = settings.hairstyleItems.length;
+        settings.hairstyleItems = [];
+        report.changed = true;
+    }
+
+    if (report.changed) {
+        iigLog(
+            'INFO',
+            `Removed obsolete embedded media: avatars=${report.avatars}, wardrobe=${report.wardrobe}, hairstyles=${report.hairstyles}`,
+        );
+    }
+    if (report.avatarsDeferred) {
+        iigLog('WARN', 'Legacy avatar cleanup deferred until every avatar is safely migrated and inactive');
+    }
+    return report;
 }
 
 // ----- Naistera helpers (знают про настройки, но не про провайдеров) -----
@@ -684,7 +810,6 @@ export function normalizeConfiguredEndpoint(apiType, endpoint) {
         if (apiType === 'void') return DEFAULT_ENDPOINTS.void;
         if (apiType === 'openrouter') return DEFAULT_ENDPOINTS.openrouter;
         if (apiType === 'electronhub') return DEFAULT_ENDPOINTS.electronhub;
-        if (apiType === 'aigate') return DEFAULT_ENDPOINTS.aigate;
         return '';
     }
     if (apiType === 'naistera') {
@@ -1163,7 +1288,7 @@ export function migrateAdditionalReferencesToLorebook(settings = getSettings()) 
     const legacyRefs = Array.isArray(settings.additionalReferences) ? settings.additionalReferences : [];
     if (legacyRefs.length === 0) {
         settings.additionalReferences = [];
-        return;
+        return false;
     }
 
     // Переливаем в refs первого лорбука (обычно «My library»). Существующие
@@ -1177,6 +1302,7 @@ export function migrateAdditionalReferencesToLorebook(settings = getSettings()) 
     // Очищаем legacy-поле после успешной миграции.
     settings.additionalReferences = [];
     iigLog('INFO', `Migrated ${migrated.length} additional references to lorebook "${target.name}"`);
+    return true;
 }
 
 /**

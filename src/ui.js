@@ -33,6 +33,7 @@ import {
     buildApiSettingsSectionHtml,
     bindConnectionProfilesEvents,
     bindApiSectionEvents,
+    syncNovelaiModelControls,
 } from './ui/apiSection.js';
 import {
     buildReferencesSettingsSectionHtml,
@@ -69,8 +70,8 @@ function buildUpdateVisibility(settings) {
         const isOpenRouter = apiType === 'openrouter';
         const isElectronHub = apiType === 'electronhub';
         const isVoid = apiType === 'void';
-        const isAIGate = apiType === 'aigate';
         const isNovelAI = apiType === 'novelai';
+        syncNovelaiModelControls(settings);
 
         // Поддерживает ли активный провайдер референсы (учитывая модель).
         const provider = resolveActiveProvider(settings);
@@ -81,7 +82,7 @@ function buildUpdateVisibility(settings) {
         // показывается не только для Gemini, но и для любого OpenAI-семейства,
         // которое поддерживает /edits, и для OpenRouter/Electron Hub. Naistera
         // использует свой отдельный блок.
-        const commonAvatarRefsVisible = (isGemini || isOpenAI || isOpenRouter || isElectronHub || isVoid || isAIGate || isNovelAI) && refsSupported;
+        const commonAvatarRefsVisible = (isGemini || isOpenAI || isOpenRouter || isElectronHub || isVoid || isNovelAI) && refsSupported;
 
         // Model is used for OpenAI and Gemini; Naistera and NovelAI have their own selectors.
         document.getElementById('iig_model_row')?.classList.toggle('iig-hidden', isNaistera || isNovelAI);
@@ -140,7 +141,7 @@ function buildUpdateVisibility(settings) {
 
         const avatarSection = document.getElementById('iig_avatar_section');
         if (avatarSection) {
-            avatarSection.classList.toggle('iig-hidden', !(isGemini || isOpenRouter || isVoid || isAIGate));
+            avatarSection.classList.toggle('iig-hidden', !(isGemini || isOpenRouter || isVoid));
         }
 
         // «Общий» avatar refs блок — для Gemini / OpenAI-c-refs / OpenRouter.
@@ -154,7 +155,6 @@ function buildUpdateVisibility(settings) {
                 if (isOpenRouter) titleEl.textContent = 'OpenRouter';
                 else if (isElectronHub) titleEl.textContent = 'Electron Hub';
                 else if (isVoid) titleEl.textContent = 'VoidAI / RouteMyAI';
-                else if (isAIGate) titleEl.textContent = 'AIGate';
                 else if (isOpenAI) titleEl.textContent = 'OpenAI / GPT Image';
                 else titleEl.textContent = 'Gemini / nano-banana';
             }

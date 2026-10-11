@@ -24,6 +24,7 @@ import {
     parseImageDataUrl,
 } from './utils.js';
 import { callVisionApi, DEFAULT_VISION_PROMPT } from './vision.js';
+import { renderWardrobeBulkCleanup } from './wardrobeBulkUi.js';
 
 // ── Constants ──
 
@@ -94,7 +95,7 @@ export function swGetSettings() {
     if (!s.sharedUserActiveByPersona || typeof s.sharedUserActiveByPersona !== 'object') s.sharedUserActiveByPersona = {};
     if (!s.sharedBotActiveByChat || typeof s.sharedBotActiveByChat !== 'object') s.sharedBotActiveByChat = {};
     if (!s.sharedDeletedSourceIds || typeof s.sharedDeletedSourceIds !== 'object') s.sharedDeletedSourceIds = { bot: [], user: [] };
-    if (s.generationProvider === 'problembo') {
+    if (['problembo', 'wellflow', 'aigate'].includes(s.generationProvider)) {
         s.generationOverrideEnabled = false;
         s.generationProvider = '';
         s.generationProfileId = '';
@@ -749,6 +750,9 @@ async function swMigrateToSharedUnlocked(side, { silent = false } = {}) {
                 }
             }
             if (!stored) item.base64 = o.base64 || '';
+            // Batch cleanup can run while an image import is awaiting storage.
+            // Do not re-add a source removed during that await.
+            if (s.sharedDeletedSourceIds[side].includes(String(o.id)) || swSharedHasSrc(side, o.id)) continue;
             cfg.list().push(item);
             done++;
             if (done % 5 === 0) swSave();
@@ -853,6 +857,9 @@ const SW_DEFAULT_TRYON_PROMPT =
     + ' CRITICAL — keep the same art style: render the result in the EXACT SAME art style, medium, line work, shading, color palette and overall aesthetic as the {{personRef}} image, as if drawn by the same artist. Do NOT switch to photography, 3D render or any different illustration style.'
     + ' Natural relaxed standing pose facing the viewer, the entire figure visible from head to shoes, simple uncluttered background that does not distract from the character.'
     + ' {{outfit}}';
+
+const SW_WARDROBE_REF_INSTRUCTION =
+    '[WARDROBE EDIT — reference roles are strict. Image 1 is the PERSON IDENTITY reference only: copy the face, hair, skin, body proportions and art style, but COMPLETELY IGNORE AND REMOVE every garment, accessory and shoe worn in Image 1. Never layer, merge or duplicate that old clothing. Image 2 and any later images are OUTFIT references and are the only visual source for clothing. If no outfit image is supplied, clothing must come only from the written outfit description.]';
 
 const SW_DEFAULT_GENLOOK_PROMPT =
     'Virtual outfit design. Generate a FULL-BODY, head-to-toe image of {{name}} — the exact person from the {{personRef}} image — wearing a NEW outfit that matches the text description below.'
@@ -1125,7 +1132,7 @@ async function swGenerateWardrobeImage(side, extraReferences, prompt) {
     }
 
     const rawReferences = [personB64, ...extraReferences.filter(Boolean)];
-    const dataUrlProviders = new Set(['openrouter', 'void', 'aigate', 'naistera']);
+    const dataUrlProviders = new Set(['openrouter', 'void', 'naistera']);
     const references = dataUrlProviders.has(provider.id)
         ? rawReferences.map((value) => value.startsWith('data:') ? value : `data:image/png;base64,${value}`)
         : rawReferences.map((value) => value.startsWith('data:') ? value.slice(value.indexOf(',') + 1) : value);
@@ -1138,6 +1145,8 @@ async function swGenerateWardrobeImage(side, extraReferences, prompt) {
             aspectRatio: '2:3',
             imageSize: swGetSettings().generationImageSize || undefined,
             providerSettings: settings,
+            includeReferencePromptBlocks: false,
+            referenceInstruction: SW_WARDROBE_REF_INSTRUCTION,
         },
     });
 
@@ -1220,7 +1229,7 @@ export function swOpenModal() {
         <div class="sw-modal-header">
             <span class="sw-modal-title">Гардероб — <b>${esc(cn)}</b></span>
             <div class="sw-modal-header-btns">
-                <div class="sw-header-btn sw-btn-maint" title="Управление гардеробом: распределение, дубликаты и чистка"><i class="fa-solid fa-toolbox"></i></div>
+                <div class="sw-header-btn sw-btn-maint" title="Управление гардеробом: массовое удаление, распределение, дубликаты и чистка"><i class="fa-solid fa-toolbox"></i></div>
                 <div class="sw-header-btn sw-btn-quick" title="Быстрые настройки"><i class="fa-solid fa-sliders"></i></div>
                 <div class="sw-modal-close" title="Закрыть"><i class="fa-solid fa-xmark"></i></div>
             </div>
@@ -2357,6 +2366,7 @@ function swOpenMaintenance(tab) {
         <div class="sw-maint-tabs">
             <div class="sw-maint-tab" data-mt="dedup"><i class="fa-solid fa-clone"></i> Дубликаты</div>
             <div class="sw-maint-tab" data-mt="distribution"><i class="fa-solid fa-people-arrows"></i> Распределение</div>
+            <div class="sw-maint-tab" data-mt="bulk"><i class="fa-solid fa-trash-can"></i> Удаление нарядов</div>
             <div class="sw-maint-tab" data-mt="cleanup"><i class="fa-solid fa-broom"></i> Чистка файлов</div>
         </div>
         <div class="sw-cleanup-body" id="sw-maint-body"></div>`;
@@ -2381,13 +2391,25 @@ function swOpenMaintenance(tab) {
     function show(which) {
         if (which === curTab) return;
         curTab = which;
+        body.classList.toggle('sw-bulk-body', which === 'bulk');
         for (const t of panel.querySelectorAll('.sw-maint-tab')) t.classList.toggle('sw-maint-tab-active', t.dataset.mt === which);
-        if (which === 'cleanup') swRenderCleanup(body);
+        if (which === 'bulk') renderWardrobeBulkCleanup(body, {
+            getSettings: swGetSettings,
+            getMetadata: () => ({ personas: SillyTavern.getContext().powerUserSettings?.personas || {} }),
+            getTypes: swTypes,
+            imageSrc: swImgSrc,
+            onChange() {
+                swSave(); swPage = 0;
+                if (swOpen) swRender();
+                swUpdatePromptInjection(); swInjectBarBtn();
+            },
+        });
+        else if (which === 'cleanup') swRenderCleanup(body);
         else if (which === 'distribution') swRenderDistribution(body);
         else swRenderDedup(body);
     }
     for (const t of panel.querySelectorAll('.sw-maint-tab')) t.addEventListener('click', () => show(t.dataset.mt));
-    show(['cleanup', 'distribution'].includes(tab) ? tab : 'dedup');
+    show(['cleanup', 'distribution', 'bulk'].includes(tab) ? tab : 'dedup');
 }
 
 function swRenderCleanup(body) {

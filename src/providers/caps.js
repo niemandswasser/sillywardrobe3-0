@@ -298,13 +298,6 @@ export function getActiveProviderMaxReferences(settings = getSettings()) {
     if (apiType === 'openrouter') {
         return getOpenRouterCapabilities(settings.model).maxReferences || 0;
     }
-    if (apiType === 'aigate') {
-        if (isGeminiModel(settings.model)) {
-            return getGeminiCapabilities(settings.model).maxReferences || 0;
-        }
-        const kind = classifyOpenAIModel(settings.model);
-        return getOpenAIModelMaxReferences(kind) || 0;
-    }
     if (apiType === 'naistera' || apiType === 'void') {
         return MAX_GENERATION_REFERENCE_IMAGES;
     }

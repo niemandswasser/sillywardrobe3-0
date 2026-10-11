@@ -121,7 +121,7 @@ export class NaisteraProvider extends Provider {
     }
 
     async collectReferences({ prompt = '', messageId, matchedAdditionalRefs = [], providerOptions = {} }) {
-        const settings = getSettings();
+        const settings = providerOptions.providerSettings || getSettings();
         const normalizedModel = normalizeNaisteraModel(providerOptions.model || settings.naisteraModel);
         if (!this.modelCatalog.has(normalizedModel)) {
             await this.fetchModels().catch((error) => {
@@ -135,11 +135,11 @@ export class NaisteraProvider extends Provider {
         const refs = [];
 
         const avatarGroups = [];
-        if (settings.naisteraSendCharAvatar) avatarGroups.push(await collectAvatarReferences('bot', 'dataUrl', prompt));
-        if (settings.naisteraSendUserAvatar) avatarGroups.push(await collectAvatarReferences('user', 'dataUrl', prompt));
+        if (settings.naisteraSendCharAvatar) avatarGroups.push(await collectAvatarReferences('bot', 'dataUrl', prompt, settings));
+        if (settings.naisteraSendUserAvatar) avatarGroups.push(await collectAvatarReferences('user', 'dataUrl', prompt, settings));
         refs.push(...mergeAvatarReferenceGroups(avatarGroups, MAX_GENERATION_REFERENCE_IMAGES));
 
-        for (const extra of await collectExtraReferences(prompt, 'dataUrl')) {
+        for (const extra of await collectExtraReferences(prompt, 'dataUrl', settings)) {
             if (refs.length >= MAX_GENERATION_REFERENCE_IMAGES) break;
             refs.push(extra);
         }
@@ -176,10 +176,14 @@ export class NaisteraProvider extends Provider {
         const preset = options.preset || null;
         const wantsVideoTest = Boolean(options.videoTestMode);
         const videoEveryN = normalizeNaisteraVideoFrequency(options.videoEveryN ?? settings.naisteraVideoEveryN);
-        let fullPrompt = buildFinalGenerationPrompt(prompt, style, options.matchedAdditionalRefs || [], settings);
+        let fullPrompt = buildFinalGenerationPrompt(prompt, style, options.matchedAdditionalRefs || [], settings, {
+            includeReferencePromptBlocks: options.includeReferencePromptBlocks !== false,
+        });
 
         if (references.length > 0) {
-            const refInstruction = getEffectiveRefInstruction(settings);
+            const refInstruction = typeof options.referenceInstruction === 'string'
+                ? options.referenceInstruction
+                : getEffectiveRefInstruction(settings);
             if (refInstruction) {
                 fullPrompt = `${refInstruction}\n\n${fullPrompt}`;
             }

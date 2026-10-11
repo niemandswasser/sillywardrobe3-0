@@ -1,6 +1,6 @@
 /**
  * NovelAI — генерация через серверный прокси SillyTavern
- * (/api/novelai/generate-image), без референсов.
+ * (/api/novelai/generate-image), с параметрами выбранного поколения модели.
  */
 
 import {
@@ -24,15 +24,10 @@ import { buildFinalGenerationPrompt } from '../parser.js';
 import { collectPreviousContextReferences } from '../references.js';
 import { collectAvatarReferences, collectExtraReferences, mergeAvatarReferenceGroups } from '../extras.js';
 import { Provider, throwAsProviderError } from './base.js';
+import { resolveNovelaiModel, getNovelaiModelCapabilities, clampNovelaiNumber } from './novelaiParams.js';
 
 const NOVELAI_ANLAS_GUARD_MAX_PIXELS = 1024 * 1024;
 const NOVELAI_ANLAS_GUARD_MAX_STEPS = 28;
-
-function getNovelaiModel(settings) {
-    return settings.novelaiModel === '__custom__'
-        ? String(settings.novelaiCustomModel || '').trim()
-        : String(settings.novelaiModel || '').trim();
-}
 
 function clampReferenceValue(value, fallback) {
     const number = Number(value);
@@ -100,29 +95,26 @@ export class NovelAIProvider extends Provider {
     }
 
     validate(settings) {
-        return getNovelaiModel(settings) ? [] : ['NovelAI model ID is not configured'];
+        return resolveNovelaiModel(settings) ? [] : ['NovelAI model ID is not configured'];
     }
 
     supportsReferences(settings) {
-        const model = getNovelaiModel(settings);
-        const supportsPreciseReference = settings.novelaiModel === '__custom__'
-            || model.includes('nai-diffusion-4-5')
-            || /^nai-diffusion-[5-9]/.test(model);
-        return settings.novelaiEnableReferences !== false && supportsPreciseReference;
+        const caps = getNovelaiModelCapabilities(resolveNovelaiModel(settings));
+        return settings.novelaiEnableReferences !== false && caps.preciseReference;
     }
 
-    async collectReferences({ prompt = '', messageId, matchedAdditionalRefs = [] }) {
-        const settings = getSettings();
-        if (settings.novelaiEnableReferences === false) return [];
+    async collectReferences({ prompt = '', messageId, matchedAdditionalRefs = [], providerOptions = {} }) {
+        const settings = providerOptions.providerSettings || getSettings();
+        if (!this.supportsReferences(settings)) return [];
 
         const maxRefs = MAX_GENERATION_REFERENCE_IMAGES;
         const refs = [];
         const avatarGroups = [];
-        if (settings.sendCharAvatar) avatarGroups.push(await collectAvatarReferences('bot', 'base64', prompt));
-        if (settings.sendUserAvatar) avatarGroups.push(await collectAvatarReferences('user', 'base64', prompt));
+        if (settings.sendCharAvatar) avatarGroups.push(await collectAvatarReferences('bot', 'base64', prompt, settings));
+        if (settings.sendUserAvatar) avatarGroups.push(await collectAvatarReferences('user', 'base64', prompt, settings));
         refs.push(...mergeAvatarReferenceGroups(avatarGroups, maxRefs));
 
-        for (const extra of await collectExtraReferences(prompt, 'base64')) {
+        for (const extra of await collectExtraReferences(prompt, 'base64', settings)) {
             if (refs.length >= maxRefs) break;
             refs.push(extra);
         }
@@ -148,51 +140,60 @@ export class NovelAIProvider extends Provider {
         const settings = options.providerSettings || getSettings();
         const { getRequestHeaders } = SillyTavern.getContext();
 
-        const referencesEnabled = settings.novelaiEnableReferences !== false;
+        const referencesEnabled = this.supportsReferences(settings);
+        const effectiveReferences = referencesEnabled ? references : [];
         let fullPrompt = buildFinalGenerationPrompt(
             prompt,
             style,
             referencesEnabled ? (options.matchedAdditionalRefs || []) : [],
             settings,
-            { includeReferencePromptBlocks: referencesEnabled },
+            { includeReferencePromptBlocks: referencesEnabled && options.includeReferencePromptBlocks !== false },
         );
         fullPrompt = applyNovelaiPresets(fullPrompt, settings);
-        if (references.length > 0) {
-            const instruction = getEffectiveRefInstruction(settings);
+        if (effectiveReferences.length > 0) {
+            const instruction = typeof options.referenceInstruction === 'string'
+                ? options.referenceInstruction
+                : getEffectiveRefInstruction(settings);
             if (instruction) fullPrompt = `${instruction}\n\n${fullPrompt}`;
         }
 
-        let { steps, width, height, sm, smDyn } = this._getParams(settings);
-        const model = getNovelaiModel(settings);
+        const { steps, width, height, sm, smDyn } = this._getParams(settings);
+        const model = resolveNovelaiModel(settings);
+        const caps = getNovelaiModelCapabilities(model);
+        const sampler = caps.fixedSampler || settings.novelaiSampler || 'k_euler_ancestral';
+        const scheduler = settings.novelaiScheduler || 'native';
 
         iigLog(
             'INFO',
-            `NovelAI generate: model=${model} ${width}x${height} refsEnabled=${referencesEnabled} refs=${references.length} referencePromptBlocks=${referencesEnabled ? 'on' : 'off'} steps=${steps} sampler=${settings.novelaiSampler} scheduler=${settings.novelaiScheduler} scale=${settings.novelaiScale} anlasGuard=${settings.novelaiAnlasGuard}`
+            `NovelAI generate: model=${model} ${width}x${height} refsEnabled=${referencesEnabled} refs=${effectiveReferences.length} referencePromptBlocks=${referencesEnabled ? 'on' : 'off'} steps=${steps} sampler=${sampler} scheduler=${scheduler} scale=${settings.novelaiScale} anlasGuard=${settings.novelaiAnlasGuard}`
         );
 
         const body = {
             prompt: fullPrompt,
             model,
-            sampler: settings.novelaiSampler,
-            scheduler: settings.novelaiScheduler,
+            sampler,
+            scheduler,
             steps,
             scale: settings.novelaiScale,
             width,
             height,
-            negative_prompt: settings.novelaiNegativePrompt || '',
-            decrisper: settings.novelaiDecrisper,
-            variety_boost: settings.novelaiVarietyBoost,
-            sm,
-            sm_dyn: smDyn,
             seed: -1,
-            references_enabled: referencesEnabled,
-            reference_images: referencesEnabled ? references : [],
-            reference_type: ['character', 'style', 'character&style'].includes(settings.novelaiReferenceType)
-                ? settings.novelaiReferenceType
-                : 'character&style',
-            reference_strength: clampReferenceValue(settings.novelaiReferenceStrength, 1),
-            reference_fidelity: clampReferenceValue(settings.novelaiReferenceFidelity, 0.75),
         };
+        if (caps.negativePrompt) body.negative_prompt = settings.novelaiNegativePrompt || '';
+        if (caps.cfgRescale) body.cfg_rescale = clampNovelaiNumber(settings.novelaiCfgRescale, 0, 0, 1);
+        if (caps.decrisper) body.decrisper = settings.novelaiDecrisper;
+        if (caps.varietyBoost) body.variety_boost = settings.novelaiVarietyBoost;
+        if (caps.smea) Object.assign(body, { sm, sm_dyn: smDyn });
+        if (referencesEnabled) {
+            Object.assign(body, {
+                references_enabled: true,
+                reference_images: effectiveReferences,
+                reference_type: ['character', 'style', 'character&style'].includes(settings.novelaiReferenceType)
+                    ? settings.novelaiReferenceType : 'character&style',
+                reference_strength: clampReferenceValue(settings.novelaiReferenceStrength, 1),
+                reference_fidelity: clampReferenceValue(settings.novelaiReferenceFidelity, 0.75),
+            });
+        }
 
         let response;
         try {
@@ -225,18 +226,16 @@ export class NovelAIProvider extends Provider {
     }
 
     _getParams(settings) {
-        let steps = Math.min(settings.novelaiSteps || 28, 50);
+        const model = resolveNovelaiModel(settings);
+        const caps = getNovelaiModelCapabilities(model);
+        let steps = caps.fixedSteps || Math.round(clampNovelaiNumber(settings.novelaiSteps, 28, 1, 50));
         const sizeEntry = resolveNovelaiSize(settings.novelaiSize);
         let width = sizeEntry.width;
         let height = sizeEntry.height;
         let sm = settings.novelaiSm || false;
         let smDyn = settings.novelaiSmDyn || false;
 
-        const model = getNovelaiModel(settings);
-        if (settings.novelaiSampler === 'ddim'
-            || ['nai-diffusion-4-curated-preview', 'nai-diffusion-4-full',
-                'nai-diffusion-4-5-full', 'nai-diffusion-4-5-curated'].includes(model)
-            || /^nai-diffusion-[5-9]/.test(model)) {
+        if (settings.novelaiSampler === 'ddim' || !caps.smea) {
             sm = false;
             smDyn = false;
         }

@@ -58,21 +58,21 @@ export class OpenAIProvider extends Provider {
         return isGptImageFamily(kind) || kind === 'flux-kontext';
     }
 
-    async collectReferences({ prompt = '', messageId, matchedAdditionalRefs = [] }) {
-        const settings = getSettings();
+    async collectReferences({ prompt = '', messageId, matchedAdditionalRefs = [], providerOptions = {} }) {
+        const settings = providerOptions.providerSettings || getSettings();
         const modelKind = classifyOpenAIModel(settings.model);
         // Flux Kontext принимает только 1 reference; gpt-image-* — до MAX.
         const maxRefs = getOpenAIModelMaxReferences(modelKind) || MAX_GENERATION_REFERENCE_IMAGES;
         const refs = [];
 
         const avatarGroups = [];
-        if (settings.sendCharAvatar) avatarGroups.push(await collectAvatarReferences('bot', 'base64', prompt));
-        if (settings.sendUserAvatar) avatarGroups.push(await collectAvatarReferences('user', 'base64', prompt));
+        if (settings.sendCharAvatar) avatarGroups.push(await collectAvatarReferences('bot', 'base64', prompt, settings));
+        if (settings.sendUserAvatar) avatarGroups.push(await collectAvatarReferences('user', 'base64', prompt, settings));
         refs.push(...mergeAvatarReferenceGroups(avatarGroups, maxRefs));
 
         // Extras (NPC + wardrobe) — добавляем до matchedAdditionalRefs, чтобы
         // приоритет важных контекстных рефов был выше чем у lorebook-матчей.
-        for (const extra of await collectExtraReferences(prompt, 'base64')) {
+        for (const extra of await collectExtraReferences(prompt, 'base64', settings)) {
             if (refs.length >= maxRefs) break;
             refs.push(extra);
         }
@@ -99,12 +99,16 @@ export class OpenAIProvider extends Provider {
 
     async generate({ prompt, style, references = [], options = {} }) {
         const settings = options.providerSettings || getSettings();
-        let fullPrompt = buildFinalGenerationPrompt(prompt, style, options.matchedAdditionalRefs || [], settings);
+        let fullPrompt = buildFinalGenerationPrompt(prompt, style, options.matchedAdditionalRefs || [], settings, {
+            includeReferencePromptBlocks: options.includeReferencePromptBlocks !== false,
+        });
 
         // Префикс refInstruction — только когда реально уходит хотя бы один
         // ref в /v1/images/edits. Без рефов /generations не нуждается в нём.
         if (references.length > 0) {
-            const refInstruction = getEffectiveRefInstruction(settings);
+            const refInstruction = typeof options.referenceInstruction === 'string'
+                ? options.referenceInstruction
+                : getEffectiveRefInstruction(settings);
             if (refInstruction) {
                 fullPrompt = `${refInstruction}\n\n${fullPrompt}`;
             }

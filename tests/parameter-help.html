@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="ru">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="../style.css">
+<style>
+    body { background: #222; color: #eee; margin: 0; }
+    #panel { width: min(360px, 100%); height: 220px; overflow: auto; }
+    #panel > div { height: 600px; }
+    #edge { position: fixed; right: 0; bottom: 0; }
+</style>
+<div id="panel" class="iig-settings"><div><label id="label" class="checkbox_label"><input id="option" type="checkbox">Anlas Guard</label></div></div>
+<label id="edge">Prompt Guidance (CFG Scale)</label>
+<pre id="result">RUNNING</pre>
+<script type="module">
+import { renderParameterHelp, bindParameterHelp } from '../src/ui/parameterHelp.js';
+const check = (condition, message) => { if (!condition) throw new Error(message); };
+try {
+    const text = 'Справка: "цвет" <script>опасный текст</scr' + 'ipt> & чужие настройки не меняем.';
+    document.getElementById('label').insertAdjacentHTML('beforeend', renderParameterHelp(text));
+    document.getElementById('edge').insertAdjacentHTML('beforeend', renderParameterHelp(text.repeat(5)));
+    const [button, edge] = document.querySelectorAll('[data-iig-param-help]');
+    check(button.dataset.iigParamHelp === text, 'attribute escaping');
+    check(document.querySelectorAll('script').length === 1, 'HTML must not be injected');
+    bindParameterHelp();
+    button.dispatchEvent(new PointerEvent('pointerenter', { pointerType: 'mouse' }));
+    let bubble = document.querySelector('.iig-param-tooltip');
+    check(bubble?.textContent === text, 'desktop hover opens hint');
+    check(bubble.parentElement === document.body, 'tooltip must escape panel overflow');
+    check(button.getAttribute('aria-expanded') === 'true', 'accessible expanded state');
+    button.dispatchEvent(new PointerEvent('pointerleave', { pointerType: 'mouse' }));
+    check(!document.querySelector('.iig-param-tooltip'), 'hover leave closes hint');
+    button.dispatchEvent(new PointerEvent('pointerenter', { pointerType: 'touch' }));
+    check(!document.querySelector('.iig-param-tooltip'), 'touch enter is not hover');
+    button.click();
+    check(!document.getElementById('option').checked, 'tap help must not toggle checkbox');
+    button.dispatchEvent(new PointerEvent('pointerleave', { pointerType: 'touch' }));
+    check(document.querySelector('.iig-param-tooltip'), 'tap pins hint until dismissed');
+    button.click();
+    check(!document.querySelector('.iig-param-tooltip'), 'second tap closes hint');
+    button.focus();
+    check(document.querySelector('.iig-param-tooltip'), 'keyboard focus opens hint');
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
+    check(!document.querySelector('.iig-param-tooltip'), 'Escape closes hint');
+    edge.click();
+    bubble = document.querySelector('.iig-param-tooltip');
+    const rect = bubble.getBoundingClientRect();
+    check(rect.left >= 0 && rect.right <= innerWidth && rect.top >= 0 && rect.bottom <= innerHeight,
+        'hint must fit the viewport at the screen edge');
+    document.body.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+    check(!document.querySelector('.iig-param-tooltip'), 'outside tap closes hint');
+    button.click();
+    document.getElementById('panel').dispatchEvent(new Event('scroll'));
+    check(!document.querySelector('.iig-param-tooltip'), 'panel scroll closes hint');
+    // Rebinding an unchanged panel must not double-register clicks.
+    bindParameterHelp();
+    bindParameterHelp();
+    button.click();
+    check(document.querySelectorAll('.iig-param-tooltip').length === 1, 'one tooltip after rebind');
+    // Old browser fallback (no Popover API) must also be visible and dismissible.
+    button.click();
+    const original = HTMLElement.prototype.showPopover;
+    HTMLElement.prototype.showPopover = undefined;
+    edge.click();
+    bubble = document.querySelector('.iig-param-tooltip');
+    check(bubble && !bubble.hasAttribute('popover') && bubble.getBoundingClientRect().height > 0, 'fallback visible');
+    edge.click();
+    HTMLElement.prototype.showPopover = original;
+    document.getElementById('result').textContent = 'PASS: hover, tap, keyboard, escaping, checkbox isolation, viewport fit, scroll, rebind, fallback';
+} catch (error) {
+    document.getElementById('result').textContent = 'FAIL: ' + error.stack;
+}
+</script>
+</html>

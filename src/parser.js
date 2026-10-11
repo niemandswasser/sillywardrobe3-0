@@ -26,6 +26,7 @@ import {
     normalizeStoredImagePath,
     sanitizeForHtml,
     sanitizeForSingleQuotedAttribute,
+    isErrorImageSrc,
 } from './utils.js';
 import { buildExtraPromptBlocks } from './extras.js';
 import {
@@ -140,7 +141,7 @@ export function extractGeneratedImageUrlsFromText(text) {
             src.startsWith('data:') ||
             src.includes('[IMG:') ||
             src.includes('[VID:') ||
-            src.endsWith('/error.svg') ||
+            isErrorImageSrc(src) ||
             seen.has(src)
         ) {
             continue;
@@ -680,7 +681,7 @@ export async function parseImageTags(text, options = {}) {
         // Determine if this needs generation
         let needsGeneration = false;
         const hasMarker = srcValue.includes('[IMG:GEN]') || srcValue.includes('[IMG:');
-        const hasErrorImage = srcValue.includes('error.svg'); // Our error placeholder - NO auto-retry
+        const hasErrorImage = isErrorImageSrc(srcValue); // Our error placeholder - NO auto-retry
         const hasPath = srcValue && srcValue.startsWith('/') && srcValue.length > 5;
 
         // Skip error images - user must click to retry manually (prevents conflict on swipe)

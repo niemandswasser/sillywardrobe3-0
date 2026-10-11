@@ -180,10 +180,10 @@ export function getMatchedNpcs(prompt) {
 
 export { swUpdatePromptInjection as updateWardrobeInjection };
 
-export async function getWardrobeAvatarOverrideBase64(side) {
+export async function getWardrobeAvatarOverrideBase64(side, settings = getSettings()) {
     const normalized = side === 'bot' ? 'bot' : 'user';
     const libraryKind = normalized === 'bot' ? 'char' : 'user';
-    if (getActiveCustomCharacterLibraryProfileKey(libraryKind, getSettings())) return null;
+    if (getActiveCustomCharacterLibraryProfileKey(libraryKind, settings)) return null;
     if (!isActiveOutfitTryOn(normalized)) return null;
     return await getActiveOutfitBase64(normalized);
 }
@@ -193,12 +193,11 @@ export async function getWardrobeAvatarOverrideBase64(side) {
  * temporary avatar; otherwise every enabled image from the master character
  * library is returned in its provider-specific format.
  */
-export async function collectAvatarReferences(side, format = 'base64', prompt = '') {
+export async function collectAvatarReferences(side, format = 'base64', prompt = '', settings = getSettings()) {
     const normalized = side === 'bot' ? 'bot' : 'user';
     const kind = normalized === 'bot' ? 'char' : 'user';
-    const settings = getSettings();
     if (!await shouldSendCharacterLibraryReference(kind, prompt, settings)) return [];
-    const override = await getWardrobeAvatarOverrideBase64(normalized);
+    const override = await getWardrobeAvatarOverrideBase64(normalized, settings);
     if (override) {
         return [format === 'dataUrl' ? `data:image/png;base64,${override}` : override];
     }
@@ -363,8 +362,8 @@ export function updateAvatarAppearanceInjection() {
  *
  * Возвращает массив строк готовых к push в `references` массив провайдера.
  */
-export async function collectExtraReferences(prompt, format = 'base64') {
-    const objects = await collectExtraReferenceObjects(prompt, format);
+export async function collectExtraReferences(prompt, format = 'base64', settings = getSettings()) {
+    const objects = await collectExtraReferenceObjects(prompt, format, settings);
     return objects.map((ref) => ref.image);
 }
 
@@ -374,8 +373,7 @@ export async function collectExtraReferences(prompt, format = 'base64') {
  * 'outfit-user'. Нужно провайдерам, которые подписывают референсы в промпте
  * («Image N is X's FACE...») — без подписей модель путает аутфиты с лицами.
  */
-export async function collectExtraReferenceObjects(prompt, format = 'base64') {
-    const settings = getSettings();
+export async function collectExtraReferenceObjects(prompt, format = 'base64', settings = getSettings()) {
     const refs = [];
 
     const wrap = (b64) => format === 'dataUrl' ? `data:image/png;base64,${b64}` : b64;

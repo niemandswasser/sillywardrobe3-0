@@ -41,6 +41,50 @@ import { t } from '../i18n.js';
 import { Popup } from '../../../../../popup.js';
 import { buildSettingsSectionHtml } from './common.js';
 import { novelaiPresetSection } from './presets.js';
+import { resolveNovelaiModel, getNovelaiModelCapabilities } from '../providers/novelaiParams.js';
+import { renderParameterHelp, bindParameterHelp } from './parameterHelp.js';
+
+export function syncNovelaiModelControls(settings) {
+    const caps = getNovelaiModelCapabilities(resolveNovelaiModel(settings));
+    const setFixed = (id, stored, fixed) => {
+        const input = document.getElementById(id);
+        if (!input) return;
+        input.disabled = fixed !== null;
+        input.value = String(fixed ?? stored);
+    };
+    setFixed('iig_novelai_steps', settings.novelaiSteps ?? 28, caps.fixedSteps);
+    setFixed('iig_novelai_sampler', settings.novelaiSampler, caps.fixedSampler);
+    setFixed('iig_novelai_scheduler', settings.novelaiScheduler, caps.fixedScheduler);
+    setFixed('iig_novelai_cfg_rescale', settings.novelaiCfgRescale ?? 0, caps.cfgRescale ? null : 0);
+
+    document.getElementById('iig_novelai_negative_presets')?.classList.toggle('iig-hidden', !caps.negativePrompt);
+    const hint = document.getElementById('iig_novelai_model_hint');
+    if (hint) {
+        hint.textContent = caps.medium
+            ? t`V5 Medium: 14 steps and Euler Ancestral are fixed. Scheduler defaults to native. Custom negative prompts, CFG Rescale, reference images, Decrisper, Variety+ and SMEA are unavailable. Prompt Guidance remains adjustable.`
+            : caps.v5
+                ? t`V5: steps, sampler, scheduler, Prompt Guidance, CFG Rescale and negative prompts are adjustable. Defaults: Euler Ancestral and native. Reference images, Decrisper, Variety+ and SMEA are unavailable.`
+                : t`Parameters follow the selected model. Precise Reference images are supported on V4.5; SMEA is available on V3. Unavailable options are hidden or locked without changing saved values.`;
+    }
+    for (const [id, available] of [
+        ['iig_novelai_decrisper', caps.decrisper],
+        ['iig_novelai_variety_boost', caps.varietyBoost],
+        ['iig_novelai_sm', caps.smea],
+        ['iig_novelai_sm_dyn', caps.smea],
+    ]) {
+        document.getElementById(id)?.closest('.checkbox_label')?.classList.toggle('iig-hidden', !available);
+    }
+    const refsToggle = document.getElementById('iig_novelai_enable_references');
+    if (refsToggle) {
+        refsToggle.disabled = !caps.preciseReference;
+        refsToggle.checked = caps.preciseReference && settings.novelaiEnableReferences !== false;
+    }
+    const refsVisible = caps.preciseReference && settings.novelaiEnableReferences !== false;
+    for (const id of ['iig_novelai_reference_type', 'iig_novelai_reference_strength', 'iig_novelai_reference_fidelity']) {
+        document.getElementById(id)?.closest('.flex-row')?.classList.toggle('iig-hidden', !refsVisible);
+    }
+    document.getElementById('iig_novelai_reference_hint')?.classList.toggle('iig-hidden', !refsVisible);
+}
 
 // ----- HTML -----
 
@@ -55,7 +99,7 @@ function buildNovelaiNegativePresetBlockHtml(settings) {
         <div class="iig-settings-card-nested" id="iig_novelai_negative_presets">
             <h5>${t`NovelAI negative presets`}</h5>
             <div class="flex-row">
-                <label for="iig_novelai_negative_preset_select">${t`Preset`}</label>
+                <label for="iig_novelai_negative_preset_select">${t`Preset`} ${renderParameterHelp(t`A saved negative prompt for NovelAI only. Select one to load it; edit the text and press Save to update it. You can create and delete your own presets.`)}</label>
                 <select id="iig_novelai_negative_preset_select" class="flex1">
                     ${options || `<option value="">${t`(no presets)`}</option>`}
                 </select>
@@ -67,7 +111,7 @@ function buildNovelaiNegativePresetBlockHtml(settings) {
                 <div></div>
             </div>
             <div class="flex-col" style="margin-top: 8px;">
-                <label for="iig_novelai_negative_prompt">${t`Negative prompt`}</label>
+                <label for="iig_novelai_negative_prompt">${t`Negative prompt`} ${renderParameterHelp(t`Things the model should avoid, such as text, watermarks or anatomy defects. This reduces their likelihood but is not a guarantee. V5 Medium does not accept a custom negative prompt.`)}</label>
                 <textarea id="iig_novelai_negative_prompt" class="text_pole iig-settings-textarea" rows="4" placeholder="${t`Things to avoid in the image`}">${sanitizeForHtml(settings.novelaiNegativePrompt || '')}</textarea>
             </div>
             <div class="iig-debug-actions" style="margin-top: 8px;">
@@ -125,6 +169,53 @@ function buildConnectionProfilesBlockHtml(settings = getSettings()) {
                     </div>
                 </div>
             </div>
+            <p class="hint">${t`A connection profile stores the API type, endpoint, key, model, image size and quality settings, plus provider-specific reference options. Styles, lorebooks, NPCs and wardrobe data remain shared.`}</p>
+        </div>
+    `;
+}
+
+function buildExtBlocksProfileOptionsHtml(settings, selectedId) {
+    const activeLabel = t`Active profile`;
+    const profileOptions = ensureConnectionProfiles(settings).map((profile) => {
+        const model = profile.apiType === 'naistera'
+            ? profile.naisteraModel
+            : profile.apiType === 'novelai'
+                ? (profile.novelaiCustomModel || profile.novelaiModel)
+                : profile.model;
+        const details = [profile.apiType, model].filter(Boolean).join(' · ');
+        const label = details ? `${profile.name} — ${details}` : profile.name;
+        return `<option value="${sanitizeForHtml(profile.id)}" ${profile.id === selectedId ? 'selected' : ''}>${sanitizeForHtml(label)}</option>`;
+    }).join('');
+    return `<option value="" ${selectedId ? '' : 'selected'}>${activeLabel}</option>${profileOptions}`;
+}
+
+function buildExtBlocksProfileRoutingHtml(settings) {
+    const bindings = settings.extBlocksProfileBindings || {};
+    const hidden = settings.externalBlocks && settings.extBlocksProfileRoutingEnabled ? '' : 'iig-hidden';
+    const rows = [
+        ['big', t`Large preset`],
+        ['medium', t`Medium preset`],
+        ['small', t`Small preset`],
+    ].map(([preset, label]) => `
+        <div class="flex-row">
+            <label for="iig_extblocks_profile_${preset}">${label}</label>
+            <select id="iig_extblocks_profile_${preset}" class="flex1" data-iig-extblocks-profile="${preset}">
+                ${buildExtBlocksProfileOptionsHtml(settings, bindings[preset] || '')}
+            </select>
+            <div></div>
+        </div>
+    `).join('');
+
+    return `
+        <div class="iig-settings-card-nested" id="iig_extblocks_profile_routing">
+            <label class="checkbox_label">
+                <input type="checkbox" id="iig_extblocks_profile_routing_enabled" ${settings.extBlocksProfileRoutingEnabled ? 'checked' : ''}>
+                <span>${t`Separate image profiles for ExtBlocks presets`}</span>
+            </label>
+            <div id="iig_extblocks_profile_routing_fields" class="${hidden}">
+                <p class="hint">${t`An image tag inside an external block uses the profile assigned to that block's Small, Medium, or Large preset. Unassigned presets use the active profile.`}</p>
+                ${rows}
+            </div>
         </div>
     `;
 }
@@ -142,6 +233,7 @@ export function buildApiSettingsSectionHtml(settings = getSettings()) {
                 <input type="checkbox" id="iig_external_blocks" ${settings.externalBlocks ? 'checked' : ''}>
                 <span>${t`Process external blocks`}</span>
             </label>
+            ${buildExtBlocksProfileRoutingHtml(settings)}
 
             <div class="flex-row">
                 <label for="iig_api_type">${t`API type`}</label>
@@ -152,7 +244,6 @@ export function buildApiSettingsSectionHtml(settings = getSettings()) {
                     <option value="electronhub" ${settings.apiType === 'electronhub' ? 'selected' : ''}>${t`Electron Hub (/v1/images/*)`}</option>
                     <option value="naistera" ${settings.apiType === 'naistera' ? 'selected' : ''}>${t`Naistera (naistera.org)`}</option>
                     <option value="void" ${settings.apiType === 'void' ? 'selected' : ''}>${t`VoidAI / RouteMyAI (chat-completions)`}</option>
-                    <option value="aigate" ${settings.apiType === 'aigate' ? 'selected' : ''}>${t`AIGate (GPT Image + Gemini)`}</option>
                     <option value="novelai" ${settings.apiType === 'novelai' ? 'selected' : ''}>${t`NovelAI (via ST proxy)`}</option>
                 </select>
                 <div></div>
@@ -236,7 +327,7 @@ export function buildApiSettingsSectionHtml(settings = getSettings()) {
                 <div></div>
             </div>
 
-            <div id="iig_avatar_section" class="iig-settings-card-nested ${settings.apiType !== 'gemini' && settings.apiType !== 'openrouter' && settings.apiType !== 'void' ? 'iig-hidden' : ''}">
+            <div id="iig_avatar_section" class="iig-settings-card-nested ${!['gemini', 'openrouter', 'void'].includes(settings.apiType) ? 'iig-hidden' : ''}">
                 <div class="flex-row">
                     <label for="iig_aspect_ratio">${t`Aspect ratio`}</label>
                     <select id="iig_aspect_ratio" class="flex1">
@@ -330,7 +421,7 @@ export function buildApiSettingsSectionHtml(settings = getSettings()) {
                 <p class="hint">${t`Uses NovelAI API key from SillyTavern's API settings (NovelAI section).`}</p>
 
                 <div class="flex-row">
-                    <label for="iig_novelai_model">${t`Model`}</label>
+                    <label for="iig_novelai_model">${t`Model`} ${renderParameterHelp(t`The image generation model. Available parameters depend on the model. V5 Medium uses 14 steps and Euler Ancestral; Precise Reference is available on V4.5.`)}</label>
                     <select id="iig_novelai_model" class="flex1">
                         ${NOVELAI_MODELS.map(m => `<option value="${m.value}" ${settings.novelaiModel === m.value ? 'selected' : ''}>${m.text}</option>`).join('')}
                     </select>
@@ -338,13 +429,14 @@ export function buildApiSettingsSectionHtml(settings = getSettings()) {
                 </div>
 
                 <div class="flex-row ${settings.novelaiModel === '__custom__' ? '' : 'iig-hidden'}" id="iig_novelai_custom_model_row">
-                    <label for="iig_novelai_custom_model">${t`Custom model ID`}</label>
+                    <label for="iig_novelai_custom_model">${t`Custom model ID`} ${renderParameterHelp(t`The exact model ID expected by the API, not a display name. A custom ID does not bypass the model's parameter restrictions.`)}</label>
                     <input type="text" id="iig_novelai_custom_model" class="text_pole flex1" value="${sanitizeForHtml(settings.novelaiCustomModel || '')}" placeholder="nai-diffusion-5-...">
                     <div></div>
                 </div>
+                <p class="hint" id="iig_novelai_model_hint"></p>
 
                 <div class="flex-row">
-                    <label for="iig_novelai_sampler">${t`Sampler`}</label>
+                    <label for="iig_novelai_sampler">${t`Sampler`} ${renderParameterHelp(t`The algorithm that turns noise into an image. It affects composition, details and the result even with the same seed. Default: Euler Ancestral; fixed on V5 Medium.`)}</label>
                     <select id="iig_novelai_sampler" class="flex1">
                         ${NOVELAI_SAMPLERS.map(s => `<option value="${s}" ${settings.novelaiSampler === s ? 'selected' : ''}>${s}</option>`).join('')}
                     </select>
@@ -352,7 +444,7 @@ export function buildApiSettingsSectionHtml(settings = getSettings()) {
                 </div>
 
                 <div class="flex-row">
-                    <label for="iig_novelai_scheduler">${t`Scheduler`}</label>
+                    <label for="iig_novelai_scheduler">${t`Scheduler`} ${renderParameterHelp(t`How the noise level changes over the sampling steps. Changing it can change the result without changing the prompt. Default: native.`)}</label>
                     <select id="iig_novelai_scheduler" class="flex1">
                         ${NOVELAI_SCHEDULERS.map(s => `<option value="${s}" ${settings.novelaiScheduler === s ? 'selected' : ''}>${s}</option>`).join('')}
                     </select>
@@ -360,19 +452,25 @@ export function buildApiSettingsSectionHtml(settings = getSettings()) {
                 </div>
 
                 <div class="flex-row">
-                    <label for="iig_novelai_steps">${t`Steps`}</label>
+                    <label for="iig_novelai_steps">${t`Steps`} ${renderParameterHelp(t`The number of image refinement iterations. More steps take longer and may cost more, but do not always improve the image. Anlas Guard caps this at 28; V5 Medium always uses 14.`)}</label>
                     <input type="number" id="iig_novelai_steps" class="text_pole flex1" min="1" max="50" step="1" value="${settings.novelaiSteps || 28}">
                     <div></div>
                 </div>
 
                 <div class="flex-row">
-                    <label for="iig_novelai_scale">${t`CFG Scale`}</label>
+                    <label for="iig_novelai_scale">Prompt Guidance (CFG Scale) ${renderParameterHelp(t`How strongly the model follows the prompt. Lower values allow more freedom; higher values can strengthen details but may cause harsh colors or artifacts. Also called CFG Scale; sent as scale. Adjustable on V5 Medium too.`)}</label>
                     <input type="number" id="iig_novelai_scale" class="text_pole flex1" min="1" max="30" step="0.5" value="${settings.novelaiScale || 5}">
                     <div></div>
                 </div>
 
                 <div class="flex-row">
-                    <label for="iig_novelai_size">${t`Size`}</label>
+                    <label for="iig_novelai_cfg_rescale">CFG Rescale ${renderParameterHelp(t`Prompt Guidance Rescale reduces excessive color saturation caused by strong guidance. This is different from CFG Scale. 0 disables rescaling; V5 Medium fixes it at 0.`)}</label>
+                    <input type="number" id="iig_novelai_cfg_rescale" class="text_pole flex1" min="0" max="1" step="0.05" value="${settings.novelaiCfgRescale ?? 0}">
+                    <div></div>
+                </div>
+
+                <div class="flex-row">
+                    <label for="iig_novelai_size">${t`Size`} ${renderParameterHelp(t`Image width, height and aspect ratio. Larger images use more resources and can cost more. Anlas Guard reduces sizes above 1,048,576 total pixels while approximately preserving the aspect ratio.`)}</label>
                     <select id="iig_novelai_size" class="flex1">
                         ${NOVELAI_SIZES.map(s => `<option value="${s.value}" ${settings.novelaiSize === s.value ? 'selected' : ''}>${s.text}</option>`).join('')}
                     </select>
@@ -381,23 +479,26 @@ export function buildApiSettingsSectionHtml(settings = getSettings()) {
 
                 ${buildNovelaiNegativePresetBlockHtml(settings)}
 
-                <label class="checkbox_label" style="margin-top: 8px;" title="${t`Automatically adjust parameters to ensure free image generation (Opus tier). Max 1024x1024 px, max 28 steps.`}">
+                <label class="checkbox_label" style="margin-top: 8px;">
                     <input type="checkbox" id="iig_novelai_anlas_guard" ${settings.novelaiAnlasGuard ? 'checked' : ''}>
                     <span>${t`Anlas Guard (free generation)`}</span>
+                    ${renderParameterHelp(t`Caps the request at 28 steps and 1,048,576 total pixels; V5 Medium keeps 14 steps. Intended for Opus free-generation limits, not a billing guarantee. References and other paid features may still cost Anlas.`)}
                 </label>
 
                 <label class="checkbox_label">
                     <input type="checkbox" id="iig_novelai_decrisper" ${settings.novelaiDecrisper ? 'checked' : ''}>
                     <span>${t`Decrisper (dynamic thresholding)`}</span>
+                    ${renderParameterHelp(t`Mitigates color and visual artifacts, especially with high Prompt Guidance. It can change the look at lower guidance too. Unavailable on V5.`)}
                 </label>
 
-                <label class="checkbox_label" style="margin-top: 8px;" title="${t`When disabled, NovelAI receives no images and all reference tabs are hidden.`}">
+                <label class="checkbox_label" style="margin-top: 8px;">
                     <input type="checkbox" id="iig_novelai_enable_references" ${settings.novelaiEnableReferences !== false ? 'checked' : ''}>
                     <span>${t`Send references to NovelAI`}</span>
+                    ${renderParameterHelp(t`Allows reference images and their associated descriptions to be sent. Turning this off hides the reference tabs and excludes reference injections for NovelAI only. Precise Reference is available on V4.5, not V5.`)}
                 </label>
 
                 <div class="flex-row">
-                    <label for="iig_novelai_reference_type">${t`Reference type`}</label>
+                    <label for="iig_novelai_reference_type">${t`Reference type`} ${renderParameterHelp(t`Choose what to take from the reference: the character's appearance, the visual style, or both. Multiple character references may blend together.`)}</label>
                     <select id="iig_novelai_reference_type" class="flex1">
                         <option value="character" ${settings.novelaiReferenceType === 'character' ? 'selected' : ''}>${t`Character`}</option>
                         <option value="style" ${settings.novelaiReferenceType === 'style' ? 'selected' : ''}>${t`Style`}</option>
@@ -407,32 +508,35 @@ export function buildApiSettingsSectionHtml(settings = getSettings()) {
                 </div>
 
                 <div class="flex-row">
-                    <label for="iig_novelai_reference_strength">${t`Reference strength`}</label>
+                    <label for="iig_novelai_reference_strength">${t`Reference strength`} ${renderParameterHelp(t`How strongly the reference influences the image. Higher values copy more visual cues but can also repeat the pose or camera angle. Reduce it for more freedom.`)}</label>
                     <input type="number" id="iig_novelai_reference_strength" class="text_pole flex1" min="-1" max="1" step="0.05" value="${settings.novelaiReferenceStrength ?? 1}">
                     <div></div>
                 </div>
 
                 <div class="flex-row">
-                    <label for="iig_novelai_reference_fidelity">${t`Reference fidelity`}</label>
+                    <label for="iig_novelai_reference_fidelity">${t`Reference fidelity`} ${renderParameterHelp(t`How strictly the reference is enforced. Near 1 it is harder to override through the prompt; near 0 the model is more flexible. This is separate from reference strength.`)}</label>
                     <input type="number" id="iig_novelai_reference_fidelity" class="text_pole flex1" min="-1" max="1" step="0.05" value="${settings.novelaiReferenceFidelity ?? 0.75}">
                     <div></div>
                 </div>
 
-                <p class="hint">${t`NovelAI Precise Reference is officially available for V4.5. Each reference adds Anlas cost; multiple character references may blend together.`}</p>
+                <p class="hint" id="iig_novelai_reference_hint">${t`NovelAI Precise Reference is officially available for V4.5. Each reference adds Anlas cost; multiple character references may blend together.`}</p>
 
                 <label class="checkbox_label">
                     <input type="checkbox" id="iig_novelai_variety_boost" ${settings.novelaiVarietyBoost ? 'checked' : ''}>
                     <span>${t`Variety+ (skip CFG above sigma)`}</span>
+                    ${renderParameterHelp(t`Encourages more varied compositions by adjusting guidance during generation. It may weaken prompt adherence. Unavailable on V5.`)}
                 </label>
 
                 <label class="checkbox_label">
                     <input type="checkbox" id="iig_novelai_sm" ${settings.novelaiSm ? 'checked' : ''}>
                     <span>SMEA</span>
+                    ${renderParameterHelp(t`Multipass sampling for more coherent high-resolution images. It can soften the look and increase cost. Available on V3, not V4/V5 or DDIM.`)}
                 </label>
 
                 <label class="checkbox_label">
                     <input type="checkbox" id="iig_novelai_sm_dyn" ${settings.novelaiSmDyn ? 'checked' : ''}>
                     <span>${t`SMEA Dynamic`}</span>
+                    ${renderParameterHelp(t`A dynamic SMEA variant aimed at reducing high-resolution distortions with less of the soft SMEA look. May increase cost. Available on V3, not V4/V5 or DDIM.`)}
                 </label>
 
                 <div class="iig-debug-actions" style="margin-top: 8px;">
@@ -440,6 +544,27 @@ export function buildApiSettingsSectionHtml(settings = getSettings()) {
                         <i class="fa-solid fa-coins"></i> ${t`View Anlas`}
                     </div>
                 </div>
+            </div>
+
+            <div class="iig-settings-card-nested iig-api-display-options">
+                <h4>${t`Generated image display`}</h4>
+                <div class="flex-row">
+                    <label for="iig_image_action_position">${t`Image button corner`}</label>
+                    <select id="iig_image_action_position" class="flex1">
+                        <option value="top-right" ${settings.imageActionPosition === 'top-right' ? 'selected' : ''}>${t`Top right`}</option>
+                        <option value="top-left" ${settings.imageActionPosition === 'top-left' ? 'selected' : ''}>${t`Top left`}</option>
+                        <option value="bottom-right" ${settings.imageActionPosition === 'bottom-right' ? 'selected' : ''}>${t`Bottom right`}</option>
+                        <option value="bottom-left" ${settings.imageActionPosition === 'bottom-left' ? 'selected' : ''}>${t`Bottom left`}</option>
+                    </select>
+                </div>
+                <label class="checkbox_label" title="${t`Newly generated images stay blurred until you click them.`}">
+                    <input type="checkbox" id="iig_censor_on_generate" ${settings.censorOnGenerate ? 'checked' : ''}>
+                    <span>${t`Enable blurred previews`}</span>
+                </label>
+                <label class="checkbox_label" title="${t`Show a random decorative error image when generation fails.`}">
+                    <input type="checkbox" id="iig_pretty_error_images" ${settings.prettyErrorImages ? 'checked' : ''}>
+                    <span>${t`Enable illustrated errors`}</span>
+                </label>
             </div>
 
             <div class="iig-settings-card-nested" id="iig_vision_section">
@@ -505,6 +630,9 @@ function applyProfileValuesToInputs(settings) {
     setVal('iig_api_type', settings.apiType);
     setVal('iig_endpoint', settings.endpoint);
     setChk('iig_raw_endpoint', settings.rawEndpoint);
+    setChk('iig_censor_on_generate', settings.censorOnGenerate);
+    setChk('iig_pretty_error_images', settings.prettyErrorImages);
+    setVal('iig_image_action_position', settings.imageActionPosition || 'top-right');
     setVal('iig_api_key', settings.apiKey);
     setVal('iig_model', settings.model);
     // Select holds model too — add option on-the-fly if profile's model isn't
@@ -554,6 +682,7 @@ function applyProfileValuesToInputs(settings) {
     setVal('iig_novelai_scheduler', settings.novelaiScheduler);
     setVal('iig_novelai_steps', settings.novelaiSteps);
     setVal('iig_novelai_scale', settings.novelaiScale);
+    setVal('iig_novelai_cfg_rescale', settings.novelaiCfgRescale ?? 0);
     setVal('iig_novelai_size', settings.novelaiSize);
     setVal('iig_novelai_negative_prompt', settings.novelaiNegativePrompt);
     setChk('iig_novelai_anlas_guard', settings.novelaiAnlasGuard);
@@ -589,6 +718,26 @@ function refreshProfileSelectOptions(settings) {
     select.innerHTML = profiles.map((p) =>
         `<option value="${p.id}" ${p.id === settings.activeConnectionProfileId ? 'selected' : ''}>${sanitizeForHtml(p.name)}</option>`,
     ).join('') || `<option value="">${t`(no profiles)`}</option>`;
+    refreshExtBlocksProfileSelectOptions(settings);
+}
+
+function refreshExtBlocksProfileSelectOptions(settings) {
+    document.querySelectorAll('[data-iig-extblocks-profile]').forEach((element) => {
+        if (!(element instanceof HTMLSelectElement)) return;
+        const preset = element.dataset.iigExtblocksProfile;
+        element.innerHTML = buildExtBlocksProfileOptionsHtml(
+            settings,
+            settings.extBlocksProfileBindings?.[preset] || '',
+        );
+    });
+}
+
+function syncExtBlocksProfileRoutingVisibility(settings) {
+    const fields = document.getElementById('iig_extblocks_profile_routing_fields');
+    fields?.classList.toggle(
+        'iig-hidden',
+        !settings.externalBlocks || !settings.extBlocksProfileRoutingEnabled,
+    );
 }
 
 export function bindConnectionProfilesEvents(settings, updateVisibility) {
@@ -659,6 +808,7 @@ export function bindConnectionProfilesEvents(settings, updateVisibility) {
 // ----- API section events -----
 
 export function bindApiSectionEvents(settings, updateVisibility) {
+    bindParameterHelp();
     document.getElementById('iig_enabled')?.addEventListener('change', (e) => {
         settings.enabled = e.target.checked;
         saveSettings();
@@ -666,6 +816,46 @@ export function bindApiSectionEvents(settings, updateVisibility) {
 
     document.getElementById('iig_external_blocks')?.addEventListener('change', (e) => {
         settings.externalBlocks = e.target.checked;
+        saveSettings();
+        syncExtBlocksProfileRoutingVisibility(settings);
+    });
+
+    document.getElementById('iig_extblocks_profile_routing_enabled')?.addEventListener('change', (e) => {
+        settings.extBlocksProfileRoutingEnabled = e.target.checked;
+        saveSettings();
+        syncExtBlocksProfileRoutingVisibility(settings);
+    });
+
+    document.querySelectorAll('[data-iig-extblocks-profile]').forEach((element) => {
+        element.addEventListener('change', (e) => {
+            const select = e.currentTarget;
+            if (!(select instanceof HTMLSelectElement)) return;
+            const preset = select.dataset.iigExtblocksProfile;
+            if (!['big', 'medium', 'small'].includes(preset)) return;
+            settings.extBlocksProfileBindings[preset] = select.value;
+            saveSettings();
+        });
+    });
+
+    document.getElementById('iig_censor_on_generate')?.addEventListener('change', (e) => {
+        settings.censorOnGenerate = e.target.checked;
+        if (!settings.censorOnGenerate) {
+            document.querySelectorAll('#chat .iig-img-host.iig-censored')
+                .forEach((host) => host.classList.remove('iig-censored'));
+        }
+        saveSettings();
+    });
+
+    document.getElementById('iig_pretty_error_images')?.addEventListener('change', (e) => {
+        settings.prettyErrorImages = e.target.checked;
+        saveSettings();
+    });
+
+    document.getElementById('iig_image_action_position')?.addEventListener('change', (e) => {
+        const allowed = ['top-right', 'top-left', 'bottom-right', 'bottom-left'];
+        settings.imageActionPosition = allowed.includes(e.target.value) ? e.target.value : 'top-right';
+        document.querySelectorAll('#chat .iig-img-actions')
+            .forEach((actions) => { actions.dataset.position = settings.imageActionPosition; });
         saveSettings();
     });
 
@@ -948,6 +1138,7 @@ export function bindApiSectionEvents(settings, updateVisibility) {
     document.getElementById('iig_novelai_custom_model')?.addEventListener('input', (e) => {
         settings.novelaiCustomModel = e.target.value;
         saveSettings();
+        updateVisibility();
     });
 
     document.getElementById('iig_novelai_sampler')?.addEventListener('change', (e) => {
@@ -979,6 +1170,12 @@ export function bindApiSectionEvents(settings, updateVisibility) {
 
     document.getElementById('iig_novelai_negative_prompt')?.addEventListener('input', (e) => {
         settings.novelaiNegativePrompt = e.target.value;
+        saveSettings();
+    });
+
+    document.getElementById('iig_novelai_cfg_rescale')?.addEventListener('input', (e) => {
+        const value = Number.parseFloat(e.target.value);
+        settings.novelaiCfgRescale = Number.isFinite(value) ? Math.min(1, Math.max(0, value)) : 0;
         saveSettings();
     });
 

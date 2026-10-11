@@ -446,7 +446,27 @@ export async function fetchWithTimeout(url, init = {}, timeoutMs = 600_000, exte
 
 // ----- Error / UI asset paths -----
 
-export const ERROR_IMAGE_PATH = '/scripts/extensions/third-party/sillyimages/error.svg';
+// Resolve error assets relative to the installed extension folder. This keeps
+// renamed forks working and also recognises placeholders already stored by
+// older versions of the extension.
+export const ERROR_IMAGE_PATH = new URL('../error.svg', import.meta.url).pathname;
+
+const PRETTY_ERROR_IMAGE_BASENAMES = ['error1.png', 'error2.png', 'error3.png'];
+
+export const PRETTY_ERROR_IMAGE_PATHS = PRETTY_ERROR_IMAGE_BASENAMES.map(
+    (name) => new URL(`../${name}`, import.meta.url).pathname,
+);
+
+export function pickRandomErrorImagePath() {
+    const index = Math.floor(Math.random() * PRETTY_ERROR_IMAGE_PATHS.length);
+    return PRETTY_ERROR_IMAGE_PATHS[index];
+}
+
+const ERROR_IMAGE_SRC_RE = /\/error[123]?\.(?:svg|png|jpe?g|webp)(?:[?#]|$)/i;
+
+export function isErrorImageSrc(src) {
+    return ERROR_IMAGE_SRC_RE.test(String(src || ''));
+}
 
 // ----- Provider error -----
 

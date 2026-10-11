@@ -90,8 +90,8 @@ export class AIGateProvider extends Provider {
         return true;
     }
 
-    async collectReferences({ prompt = '', messageId, matchedAdditionalRefs = [] }) {
-        const settings = getSettings();
+    async collectReferences({ prompt = '', messageId, matchedAdditionalRefs = [], providerOptions = {} }) {
+        const settings = providerOptions.providerSettings || getSettings();
         const model = settings.model;
         let maxRefs;
         let format;
@@ -111,11 +111,11 @@ export class AIGateProvider extends Provider {
         const refs = [];
         const toImg = format === 'dataUrl' ? imageUrlToDataUrl : imageUrlToBase64;
         const avatarGroups = [];
-        if (settings.sendCharAvatar) avatarGroups.push(await collectAvatarReferences('bot', format, prompt));
-        if (settings.sendUserAvatar) avatarGroups.push(await collectAvatarReferences('user', format, prompt));
+        if (settings.sendCharAvatar) avatarGroups.push(await collectAvatarReferences('bot', format, prompt, settings));
+        if (settings.sendUserAvatar) avatarGroups.push(await collectAvatarReferences('user', format, prompt, settings));
         refs.push(...mergeAvatarReferenceGroups(avatarGroups, maxRefs));
 
-        for (const extra of await collectExtraReferences(prompt, format)) {
+        for (const extra of await collectExtraReferences(prompt, format, settings)) {
             if (refs.length >= maxRefs) break;
             refs.push(extra);
         }
@@ -175,9 +175,13 @@ export class AIGateProvider extends Provider {
             }
         }
 
-        let fullPrompt = buildFinalGenerationPrompt(prompt, style, options.matchedAdditionalRefs || [], settings);
+        let fullPrompt = buildFinalGenerationPrompt(prompt, style, options.matchedAdditionalRefs || [], settings, {
+            includeReferencePromptBlocks: options.includeReferencePromptBlocks !== false,
+        });
         if (references.length > 0) {
-            const refInstruction = getEffectiveRefInstruction(settings);
+            const refInstruction = typeof options.referenceInstruction === 'string'
+                ? options.referenceInstruction
+                : getEffectiveRefInstruction(settings);
             if (refInstruction) fullPrompt = `${refInstruction}\n\n${fullPrompt}`;
         }
 
@@ -253,9 +257,13 @@ export class AIGateProvider extends Provider {
         const model = settings.model;
         const modelKind = classifyOpenAIModel(model);
 
-        let fullPrompt = buildFinalGenerationPrompt(prompt, style, options.matchedAdditionalRefs || [], settings);
+        let fullPrompt = buildFinalGenerationPrompt(prompt, style, options.matchedAdditionalRefs || [], settings, {
+            includeReferencePromptBlocks: options.includeReferencePromptBlocks !== false,
+        });
         if (references.length > 0) {
-            const refInstruction = getEffectiveRefInstruction(settings);
+            const refInstruction = typeof options.referenceInstruction === 'string'
+                ? options.referenceInstruction
+                : getEffectiveRefInstruction(settings);
             if (refInstruction) fullPrompt = `${refInstruction}\n\n${fullPrompt}`;
         }
 

@@ -20,6 +20,7 @@ import {
     saveImageToFile,
     saveNaisteraMediaToFile,
     ERROR_IMAGE_PATH,
+    pickRandomErrorImagePath,
     decodeHtmlEntities,
     parseImageDataUrl,
     ProviderError,
@@ -44,7 +45,18 @@ import {
     validateSettings,
 } from './providers.js';
 import { buildActiveCharacterLibraryPromptBlock, getReferenceDescription, getReferenceImage, getReferenceSource, recordCharacterGeneration } from './references.js';
+import { resolveExtBlocksImageRoute } from './extBlocksIntegration.js';
 import { t } from './i18n.js';
+
+function buildTagGenerationOptions(message, tag, settings, options) {
+    const route = resolveExtBlocksImageRoute(message, tag, settings);
+    if (!route) return options;
+    return {
+        ...options,
+        providerSettings: route.providerSettings,
+        extBlocksPreset: route.preset,
+    };
+}
 
 // ----- Friendly error classification -----
 
@@ -194,7 +206,7 @@ function refToPreviewDataUrl(ref) {
  */
 function buildRequestSnapshot({ prompt, style, references, matchedAdditionalRefs, options, provider, settings }) {
     const includeReferencePromptBlocks = !(settings.apiType === 'novelai'
-        && settings.novelaiEnableReferences === false);
+        && !provider.supportsReferences(settings));
     let snapshotPrompt = buildFinalGenerationPrompt(
         prompt,
         style,
@@ -334,10 +346,14 @@ export function clearLoadingPlaceholderTimer(placeholder) {
     }
 }
 
-export function createErrorPlaceholder(tagId, errorMessage, tagInfo, friendlyInfo = null) {
+function getErrorImagePath(settings = getSettings()) {
+    return settings.prettyErrorImages ? pickRandomErrorImagePath() : ERROR_IMAGE_PATH;
+}
+
+export function createErrorPlaceholder(tagId, errorMessage, tagInfo, friendlyInfo = null, imagePath = getErrorImagePath()) {
     const img = document.createElement('img');
     img.className = 'iig-error-image';
-    img.src = ERROR_IMAGE_PATH;
+    img.src = imagePath;
     img.alt = friendlyInfo?.title || t`Generation error`;
     // Tooltip: дружелюбный заголовок + сырой текст для отладки.
     const tooltip = friendlyInfo
@@ -409,9 +425,8 @@ export async function persistGeneratedMedia(generated, statusEl, meta) {
 // ----- Main generate (provider dispatch + retry loop) -----
 
 export async function generateImageWithRetry(prompt, style, onStatusUpdate, options = {}) {
-    validateSettings();
-
-    const settings = getSettings();
+    const settings = options.providerSettings || getSettings();
+    validateSettings(settings);
     const provider = resolveActiveProvider(settings);
     if (!provider) {
         throw new Error(t`Unknown API: ${settings.apiType}`);
@@ -428,7 +443,7 @@ export async function generateImageWithRetry(prompt, style, onStatusUpdate, opti
     const baseDelay = settings.retryDelay;
 
     const novelaiReferencesDisabled = settings.apiType === 'novelai'
-        && settings.novelaiEnableReferences === false;
+        && !provider.supportsReferences(settings);
     const matchedAdditionalRefs = novelaiReferencesDisabled
         ? []
         : getMatchedAdditionalReferences(prompt);
@@ -705,7 +720,14 @@ export async function processMessageTags(messageId) {
                 tag.prompt,
                 tag.style,
                 (status) => { statusEl.textContent = status; },
-                { aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality, preset: tag.preset, messageId, signal: getLoadingSignal(loadingPlaceholder) }
+                buildTagGenerationOptions(message, tag, settings, {
+                    aspectRatio: tag.aspectRatio,
+                    imageSize: tag.imageSize,
+                    quality: tag.quality,
+                    preset: tag.preset,
+                    messageId,
+                    signal: getLoadingSignal(loadingPlaceholder),
+                })
             );
             finishLoadingGeneration(loadingPlaceholder);
             clearLoadingPlaceholderTimer(loadingPlaceholder);
@@ -747,13 +769,14 @@ export async function processMessageTags(messageId) {
                 ? { title: t`Generation cancelled`, message: t`Generation was cancelled by the user.`, detail: '' }
                 : formatProviderError(error);
 
-            const errorPlaceholder = createErrorPlaceholder(tagId, error.message, tag, friendly);
+            const errorImagePath = getErrorImagePath();
+            const errorPlaceholder = createErrorPlaceholder(tagId, error.message, tag, friendly, errorImagePath);
             errorPlaceholder.dataset.iigTagIndex = String(index);
             loadingPlaceholder.replaceWith(errorPlaceholder);
 
             // IMPORTANT: Mark tag as failed in message.mes so it displays after swipe.
             if (tag.isNewFormat) {
-                const errorTag = tag.fullMatch.replace(/src\s*=\s*(['"])[^'"]*\1/i, `src="${ERROR_IMAGE_PATH}"`);
+                const errorTag = tag.fullMatch.replace(/src\s*=\s*(['"])[^'"]*\1/i, `src="${errorImagePath}"`);
                 replaceTagInMessageSource(message, tag, errorTag);
             } else {
                 const errorMarker = `[IMG:ERROR:${error.message.substring(0, 50)}]`;
@@ -894,7 +917,14 @@ export async function regenerateSingleTag(messageId, tagIndex, instructionValue 
             tag.prompt,
             tag.style,
             (status) => { statusEl.textContent = status; },
-            { aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality, preset: tag.preset, messageId, signal: getLoadingSignal(loadingPlaceholder) }
+            buildTagGenerationOptions(message, tag, settings, {
+                aspectRatio: tag.aspectRatio,
+                imageSize: tag.imageSize,
+                quality: tag.quality,
+                preset: tag.preset,
+                messageId,
+                signal: getLoadingSignal(loadingPlaceholder),
+            })
         );
         finishLoadingGeneration(loadingPlaceholder);
         clearLoadingPlaceholderTimer(loadingPlaceholder);
@@ -1018,7 +1048,14 @@ export async function regenerateMessageImages(messageId) {
                         tag.prompt,
                         tag.style,
                         (status) => { statusEl.textContent = status; },
-                        { aspectRatio: tag.aspectRatio, imageSize: tag.imageSize, quality: tag.quality, preset: tag.preset, messageId, signal: getLoadingSignal(loadingPlaceholder) }
+                        buildTagGenerationOptions(message, tag, settings, {
+                            aspectRatio: tag.aspectRatio,
+                            imageSize: tag.imageSize,
+                            quality: tag.quality,
+                            preset: tag.preset,
+                            messageId,
+                            signal: getLoadingSignal(loadingPlaceholder),
+                        })
                     );
                     finishLoadingGeneration(loadingPlaceholder);
                     clearLoadingPlaceholderTimer(loadingPlaceholder);

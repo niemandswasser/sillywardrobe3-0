@@ -12,6 +12,7 @@ import {
     migrateRemovedProviders,
     migrateConnectionProfilesFromLegacy,
     migrateAdditionalReferencesToLorebook,
+    cleanupObsoleteEmbeddedMedia,
     saveSettings,
 } from './src/settings.js';
 import { createSettingsUI } from './src/ui.js';
@@ -31,10 +32,15 @@ import { initGallery } from './src/gallery.js';
 
     // One-time migrations: заполняем connection profiles и переносим
     // старые additionalReferences в lorebooks[0] (идемпотентно).
-    migrateRemovedProviders(settings);
-    migrateConnectionProfilesFromLegacy(settings);
-    migrateAdditionalReferencesToLorebook(settings);
-    saveSettings();
+    const startupSettingsChanged = [
+        migrateRemovedProviders(settings),
+        migrateConnectionProfilesFromLegacy(settings),
+        migrateAdditionalReferencesToLorebook(settings),
+        cleanupObsoleteEmbeddedMedia(settings).changed,
+    ].some(Boolean);
+    // Avoid rewriting the entire SillyTavern settings object on every page
+    // load. This used to serialize tens of megabytes even when unchanged.
+    if (startupSettingsChanged) saveSettings();
 
     // Register {{iig-book}} macro — делает refs-список доступным для вставки
     // в карточки / пресеты, чтобы LLM видела какие триггеры можно ставить.

@@ -9,8 +9,9 @@
  */
 
 import { t } from './i18n.js';
-import { downloadImageSrc } from './utils.js';
+import { downloadImageSrc, isErrorImageSrc } from './utils.js';
 import { regenerateSingleTag } from './pipeline.js';
+import { getSettings } from './settings.js';
 
 const IMG_SELECTOR = 'img[data-iig-instruction]';
 
@@ -36,7 +37,11 @@ export function initImageActions() {
             scanAndAttach(el);
         }
     });
-    observer.observe(chat, { childList: true, subtree: true, attributes: true, attributeFilter: ['src', 'class'] });
+    // `class` changes are extremely frequent in long/streaming chats and our
+    // own censor state already synchronizes its button explicitly. Watching
+    // only image source replacements keeps rerolls working without rescanning
+    // messages for unrelated hover/animation/layout class changes.
+    observer.observe(chat, { childList: true, subtree: true, attributes: true, attributeFilter: ['src'] });
 }
 
 function scanAndAttach(root) {
@@ -71,14 +76,20 @@ function attachActions(img) {
         if (stableIndex >= 0) img.dataset.iigTagIndex = String(stableIndex);
     }
 
-    const isError = img.classList.contains('iig-error-image');
+    const isError = img.classList.contains('iig-error-image') || isErrorImageSrc(img.getAttribute('src') || img.src);
+    if (isError) img.classList.add('iig-error-image');
     let host = img.parentElement;
 
     if (host?.classList?.contains('iig-img-host')) {
+        ensureCensorOverlay(host);
         const existing = host.querySelector(':scope > .iig-img-actions');
-        if (existing && existing.dataset.iigError === (isError ? '1' : '0')) return;
+        if (existing && existing.dataset.iigError === (isError ? '1' : '0')) {
+            applyAutoCensor(host, img, isError);
+            return;
+        }
         existing?.remove();
         host.appendChild(buildActions(img, isError));
+        applyAutoCensor(host, img, isError);
         return;
     }
 
@@ -86,7 +97,57 @@ function attachActions(img) {
     host.className = 'iig-img-host';
     img.replaceWith(host);
     host.appendChild(img);
+    ensureCensorOverlay(host);
     host.appendChild(buildActions(img, isError));
+    applyAutoCensor(host, img, isError);
+}
+
+function applyAutoCensor(host, img, isError) {
+    const sourceKey = String(img.getAttribute('src') || img.src || '');
+
+    // Regeneration replaces the image inside the existing host. Track the
+    // concrete result source rather than the host itself so every new result
+    // is censored once, while MutationObserver passes after manual reveal do
+    // not cover the same image again.
+    if (host.dataset.iigCensorSrc === sourceKey) {
+        syncCensorButton(host);
+        return;
+    }
+    host.dataset.iigCensorSrc = sourceKey;
+    setCensored(host, !isError && Boolean(getSettings().censorOnGenerate));
+}
+
+function setCensored(host, censored) {
+    host.classList.toggle('iig-censored', censored);
+    syncCensorButton(host);
+}
+
+function syncCensorButton(host) {
+    const button = host.querySelector(':scope > .iig-img-actions .iig-img-censor');
+    if (!(button instanceof HTMLButtonElement)) return;
+
+    const censored = host.classList.contains('iig-censored');
+    const label = censored ? t`Reveal image` : t`Blur image`;
+    button.title = label;
+    button.setAttribute('aria-label', label);
+    const icon = button.querySelector('i');
+    if (icon) icon.className = censored ? 'fa-solid fa-eye' : 'fa-solid fa-eye-slash';
+}
+
+function ensureCensorOverlay(host) {
+    if (host.querySelector(':scope > .iig-censor-overlay')) return;
+
+    const overlay = document.createElement('div');
+    overlay.className = 'iig-censor-overlay';
+    overlay.title = t`Click to reveal`;
+    overlay.innerHTML = '<span class="iig-censor-reveal"><i class="fa-solid fa-eye"></i></span>';
+    overlay.addEventListener('pointerdown', (event) => event.stopPropagation());
+    overlay.addEventListener('click', (event) => {
+        event.stopPropagation();
+        event.preventDefault();
+        setCensored(host, false);
+    });
+    host.appendChild(overlay);
 }
 
 function findMessageElement(element) {
@@ -107,9 +168,11 @@ function buildActions(img, isError) {
     const actions = document.createElement('div');
     actions.className = 'iig-img-actions';
     actions.dataset.iigError = isError ? '1' : '0';
+    actions.dataset.position = normalizeActionPosition(getSettings().imageActionPosition);
     actions.innerHTML = isError
         ? `<button class="iig-img-action iig-img-retry" type="button" title="${t`Retry`}" aria-label="${t`Retry`}"><i class="fa-solid fa-rotate-right"></i></button>`
         : `<button class="iig-img-action iig-img-download" type="button" title="${t`Download`}" aria-label="${t`Download`}"><i class="fa-solid fa-download"></i></button>`
+          + `<button class="iig-img-action iig-img-censor" type="button" title="${t`Blur image`}" aria-label="${t`Blur image`}"><i class="fa-solid fa-eye-slash"></i></button>`
           + `<button class="iig-img-action iig-img-regen" type="button" title="${t`Regenerate this image`}" aria-label="${t`Regenerate this image`}"><i class="fa-solid fa-rotate-right"></i></button>`;
 
     const stopAll = (e) => { e.stopPropagation(); e.preventDefault(); };
@@ -126,6 +189,11 @@ function buildActions(img, isError) {
         stopAll(e);
         await downloadImage(getCurrentImage());
     });
+    actions.querySelector('.iig-img-censor')?.addEventListener('click', (e) => {
+        stopAll(e);
+        const host = actions.parentElement;
+        if (host) setCensored(host, !host.classList.contains('iig-censored'));
+    });
     actions.querySelector('.iig-img-regen')?.addEventListener('click', async (e) => {
         stopAll(e);
         await regenerateOne(getCurrentImage());
@@ -136,6 +204,12 @@ function buildActions(img, isError) {
     });
 
     return actions;
+}
+
+function normalizeActionPosition(value) {
+    return ['top-right', 'top-left', 'bottom-right', 'bottom-left'].includes(value)
+        ? value
+        : 'top-right';
 }
 
 async function downloadImage(img) {

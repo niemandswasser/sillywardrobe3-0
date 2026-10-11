@@ -84,19 +84,19 @@ export class OpenRouterProvider extends Provider {
         return errors;
     }
 
-    async collectReferences({ prompt = '', messageId, matchedAdditionalRefs = [] }) {
-        const settings = getSettings();
+    async collectReferences({ prompt = '', messageId, matchedAdditionalRefs = [], providerOptions = {} }) {
+        const settings = providerOptions.providerSettings || getSettings();
         const caps = getOpenRouterCapabilities(settings.model);
         const maxRefs = caps.maxReferences;
         const refs = [];
 
         // Референсы в формате dataUrl (OpenRouter принимает base64 data URL в image_url.url).
         const avatarGroups = [];
-        if (settings.sendCharAvatar) avatarGroups.push(await collectAvatarReferences('bot', 'dataUrl', prompt));
-        if (settings.sendUserAvatar) avatarGroups.push(await collectAvatarReferences('user', 'dataUrl', prompt));
+        if (settings.sendCharAvatar) avatarGroups.push(await collectAvatarReferences('bot', 'dataUrl', prompt, settings));
+        if (settings.sendUserAvatar) avatarGroups.push(await collectAvatarReferences('user', 'dataUrl', prompt, settings));
         refs.push(...mergeAvatarReferenceGroups(avatarGroups, maxRefs));
 
-        for (const extra of await collectExtraReferences(prompt, 'dataUrl')) {
+        for (const extra of await collectExtraReferences(prompt, 'dataUrl', settings)) {
             if (refs.length >= maxRefs) break;
             refs.push(extra);
         }
@@ -150,10 +150,14 @@ export class OpenRouterProvider extends Provider {
             }
         }
 
-        let fullPrompt = buildFinalGenerationPrompt(prompt, style, options.matchedAdditionalRefs || [], settings);
+        let fullPrompt = buildFinalGenerationPrompt(prompt, style, options.matchedAdditionalRefs || [], settings, {
+            includeReferencePromptBlocks: options.includeReferencePromptBlocks !== false,
+        });
 
         if (references.length > 0) {
-            const refInstruction = getEffectiveRefInstruction(settings);
+            const refInstruction = typeof options.referenceInstruction === 'string'
+                ? options.referenceInstruction
+                : getEffectiveRefInstruction(settings);
             if (refInstruction) {
                 fullPrompt = `${refInstruction}\n\n${fullPrompt}`;
             }

@@ -10,7 +10,6 @@
  *   electronhub.js — Electron Hub (наследует OpenAIProvider)
  *   naistera.js    — Naistera (картинки + видео)
  *   voidai.js      — VoidAI / RouteMyAI
- *   aigate.js      — AIGate (гибрид Gemini + GPT Image)
  *   novelai.js     — NovelAI через ST-прокси
  *
  * Внешние модули (pipeline, ui, wardrobe) импортируют всё отсюда —
@@ -34,7 +33,6 @@ import { OpenRouterProvider } from './providers/openrouter.js';
 import { ElectronHubProvider } from './providers/electronhub.js';
 import { NaisteraProvider } from './providers/naistera.js';
 import { VoidProvider } from './providers/voidai.js';
-import { AIGateProvider } from './providers/aigate.js';
 import { NovelAIProvider } from './providers/novelai.js';
 
 // Re-exports — сохраняем прежний публичный API providers.js.
@@ -54,7 +52,6 @@ export {
     ElectronHubProvider,
     NaisteraProvider,
     VoidProvider,
-    AIGateProvider,
     NovelAIProvider,
 };
 
@@ -94,7 +91,6 @@ registerProvider(new OpenRouterProvider());
 registerProvider(new ElectronHubProvider());
 registerProvider(new NaisteraProvider());
 registerProvider(new VoidProvider());
-registerProvider(new AIGateProvider());
 registerProvider(new NovelAIProvider());
 
 // ----- Models fetcher (делегируется провайдеру) -----
